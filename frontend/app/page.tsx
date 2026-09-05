@@ -32,6 +32,7 @@ export default function DashboardPage() {
   const deviceVideoRef = useRef<HTMLVideoElement | null>(null);
   const hiddenCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const isWaitingForBackendRef = useRef(false);
 
   const [ipCamUrl, setIpCamUrl] = useState("http://192.168.1.2:8080/video");
   const [isStreamingDrone, setIsStreamingDrone] = useState(false);
@@ -112,6 +113,8 @@ export default function DashboardPage() {
   };
 
   const handleSocketMessage = (event: MessageEvent) => {
+    isWaitingForBackendRef.current = false;
+
     const data = JSON.parse(event.data);
     if (data.error) {
       alert(`Error: ${data.error}`);
@@ -215,12 +218,14 @@ export default function DashboardPage() {
   // New USP: Device Camera PUSH Logic (Resizing + Compression)
   const startDeviceCamera = async () => {
     try {
+      console.log("[Cam] Requesting camera access...");
       const stream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 640 }, height: { ideal: 640 } },
       });
 
       if (deviceVideoRef.current) {
         deviceVideoRef.current.srcObject = stream;
+        deviceVideoRef.current.play().catch(e => console.error("[Cam] Video play error:", e));
       }
 
       setReportState({ status: "idle" });
@@ -228,45 +233,53 @@ export default function DashboardPage() {
       wsRef.current = socket;
 
       socket.onopen = () => {
+        console.log("[Cam] WebSocket Connected! Starting brute-force stream...");
         setIsStreamingDevice(true);
         setSessionStarted(true);
         
-        // Throttling to 12 FPS (~83ms interval)
+        // Foolproof Steady Interval (5 FPS) - No deadlocks possible
         streamIntervalRef.current = setInterval(() => {
-          if (!deviceVideoRef.current || !hiddenCanvasRef.current || !wsRef.current) return;
+          if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
           
           const video = deviceVideoRef.current;
           const canvas = hiddenCanvasRef.current;
-          const context = canvas.getContext("2d");
-
-          if (video.readyState === video.HAVE_ENOUGH_DATA && context) {
-            // Resize dynamically to 640x640 to prevent network choke
-            canvas.width = 640;
-            canvas.height = 640;
-            context.drawImage(video, 0, 0, 640, 640);
-
-            // Compress as JPEG (60% quality) and push to WebSocket
-            const base64Frame = canvas.toDataURL("image/jpeg", 0.6);
-            if (wsRef.current.readyState === WebSocket.OPEN) {
-              wsRef.current.send(JSON.stringify({ frame: base64Frame }));
+          
+          if (video && canvas) {
+            const context = canvas.getContext("2d");
+            // Check if video has started playing
+            if (video.readyState >= 2 && context) {
+              canvas.width = 640;
+              canvas.height = 640;
+              context.drawImage(video, 0, 0, 640, 640);
+              
+              const base64Frame = canvas.toDataURL("image/jpeg", 0.5); 
+              if (base64Frame.length > 100) {
+                wsRef.current.send(JSON.stringify({ frame: base64Frame }));
+                console.log("[Cam] Sent frame to backend...");
+              }
             }
           }
-        }, 83); 
+        }, 200); // 200ms = 5 Frames per second (Lag-free)
       };
 
-      socket.onmessage = handleSocketMessage;
+      socket.onmessage = (event) => {
+        console.log("[Cam] Received processed frame from backend!");
+        handleSocketMessage(event);
+      };
 
       socket.onerror = (err) => {
-        console.error("Device WebSocket Error:", err);
-        alert("Failed to connect to Device Stream endpoint.");
+        console.error("[Cam] Device WebSocket Error:", err);
         stopDeviceCamera();
       };
 
-      socket.onclose = () => stopDeviceCamera();
+      socket.onclose = () => {
+        console.log("[Cam] WebSocket Closed");
+        stopDeviceCamera();
+      };
 
     } catch (err) {
       alert("Camera access denied or device not found!");
-      console.error(err);
+      console.error("[Cam] Error:", err);
     }
   };
 
@@ -548,8 +561,18 @@ function LiveDetectionView(props: {
   return (
     <>
       {/* Hidden elements strictly for backend processing - DO NOT REMOVE */}
-      <video ref={deviceVideoRef} autoPlay playsInline muted style={{ display: 'none' }} />
-      <canvas ref={hiddenCanvasRef} style={{ display: 'none' }} />
+      <video 
+        ref={deviceVideoRef} 
+        autoPlay 
+        playsInline 
+        muted 
+        onLoadedMetadata={(e) => { e.currentTarget.play().catch(console.error); }}
+        style={{ position: 'absolute', width: '1px', height: '1px', opacity: 0, zIndex: -100, pointerEvents: 'none' }} 
+      />
+      <canvas 
+        ref={hiddenCanvasRef} 
+        style={{ position: 'absolute', width: '1px', height: '1px', opacity: 0, zIndex: -100, pointerEvents: 'none' }} 
+      />
 
       <header className="topbar">
         <div>
