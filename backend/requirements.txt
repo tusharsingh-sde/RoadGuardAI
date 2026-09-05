@@ -11,7 +11,7 @@ gunicorn==23.0.0
 # Database & Auth
 SQLAlchemy==2.0.36
 PyMySQL==1.1.1
-pydantic==2.10.2
+pydantic
 pydantic-settings==2.6.1
 python-dotenv==1.0.1
 python-multipart==0.0.17

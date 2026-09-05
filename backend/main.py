@@ -328,12 +328,18 @@ def build_pdf_report(session_id: str, pothole_list: list, source: str = "Live Dr
 
 
 def upload_pdf_to_supabase(pdf_path: str, session_id: str):
-    if not supabase_client: return None
+    """PDF ko Supabase Storage bucket me upload karke public URL return karta hai."""
+    if not supabase_client:
+        return None
     remote_path = f"{session_id}.pdf"
     try:
         with open(pdf_path, "rb") as f:
             data = f.read()
-        supabase_client.storage.from_(SUPABASE_BUCKET).upload(remote_path, data, {"content-type": "application/pdf", "upsert": "true"})
+        supabase_client.storage.from_(SUPABASE_BUCKET).upload(
+            remote_path,
+            data,
+            {"content-type": "application/pdf", "upsert": "true"},
+        )
         return supabase_client.storage.from_(SUPABASE_BUCKET).get_public_url(remote_path)
     except Exception as e:
         print(f"[Supabase] upload failed: {e}", flush=True)
@@ -341,7 +347,9 @@ def upload_pdf_to_supabase(pdf_path: str, session_id: str):
 
 
 def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count: int, pdf_url: str = None):
+    """Admin ko ek branded HTML email bhejta hai, PDF attachment ke saath."""
     if not (SENDER_EMAIL and SENDER_APP_PASSWORD and ADMIN_EMAIL):
+        print("[Email] SENDER_EMAIL/SENDER_APP_PASSWORD/ADMIN_EMAIL missing in .env — skipping email.", flush=True)
         return False
     try:
         msg = MIMEMultipart("alternative")
@@ -355,8 +363,80 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
             f"Total Potholes Detected: {pothole_count}\n"
             f"Total Estimated Maintenance Cost: Rs. {total_cost}\n"
         )
-        if pdf_url: text_body += f"\nCloud copy (Supabase): {pdf_url}\n"
+        if pdf_url:
+            text_body += f"\nCloud copy (Supabase): {pdf_url}\n"
         msg.attach(MIMEText(text_body, "plain", "utf-8"))
+
+        cta_button = (
+            f'<a href="{pdf_url}" target="_blank" '
+            f'style="display:inline-block;padding:12px 22px;background-color:#19e68c;'
+            f'color:#03120b;font-weight:700;text-decoration:none;border-radius:8px;'
+            f'font-family:Arial,Helvetica,sans-serif;font-size:14px;">Open PDF Report ↗</a>'
+            if pdf_url else
+            '<p style="color:#64748b;font-family:Arial,Helvetica,sans-serif;font-size:13px;">'
+            'Cloud storage not configured — PDF attached to this email only.</p>'
+        )
+
+        html_body = f"""\
+<html>
+  <head><meta charset="utf-8"/></head>
+  <body style="margin:0;padding:0;background-color:#f1f5f9;font-family:Arial,Helvetica,sans-serif;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background-color:#f1f5f9;padding:24px 0;">
+      <tr>
+        <td align="center">
+          <table role="presentation" width="580" cellpadding="0" cellspacing="0"
+                 style="background-color:#ffffff;border-radius:12px;overflow:hidden;border:1px solid #e2e8f0;">
+            <tr>
+              <td style="background-color:#0b1a14;padding:24px 28px;">
+                <span style="color:#19e68c;font-size:20px;font-weight:700;">🛣 RoadGuard AI</span><br/>
+                <span style="color:#9fb0a8;font-size:12.5px;">Pothole Maintenance Report</span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:26px 28px 10px 28px;">
+                <p style="color:#0f172a;font-size:14px;line-height:1.6;margin:0 0 18px 0;">
+                  A pothole detection session has just completed. Summary below:
+                </p>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;
+                               padding:14px 18px;width:48%;">
+                      <span style="display:block;color:#64748b;font-size:11px;letter-spacing:.04em;">TOTAL POTHOLES</span>
+                      <span style="display:block;color:#0f172a;font-size:22px;font-weight:700;">{pothole_count}</span>
+                    </td>
+                    <td style="width:4%;"></td>
+                    <td style="background-color:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;
+                               padding:14px 18px;width:48%;">
+                      <span style="display:block;color:#64748b;font-size:11px;letter-spacing:.04em;">MAINTENANCE COST</span>
+                      <span style="display:block;color:#0f8a56;font-size:22px;font-weight:700;">Rs. {total_cost:,}</span>
+                    </td>
+                  </tr>
+                </table>
+                <p style="color:#64748b;font-size:12.5px;margin:18px 0 4px 0;">Session ID: {session_id}</p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:10px 28px 28px 28px;">
+                {cta_button}
+                <p style="color:#94a3b8;font-size:11.5px;margin-top:18px;line-height:1.5;">
+                  The full report (per-pothole photo, dimensions & cost breakdown) is attached as a PDF
+                  and also stored in the cloud link above.
+                </p>
+              </td>
+            </tr>
+            <tr>
+              <td style="background-color:#f8fafc;padding:14px 28px;border-top:1px solid #e2e8f0;">
+                <span style="color:#94a3b8;font-size:10.5px;">Generated automatically by RoadGuard AI</span>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>
+"""
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         with open(pdf_path, "rb") as f:
             part = MIMEBase("application", "octet-stream")
@@ -376,31 +456,24 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
 
 
 def process_session_report(session_id: str, pothole_list: list, source: str):
+    """PDF banata hai, Supabase pe upload karta hai, aur admin ko email karta hai."""
     write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
     try:
         pdf_path, total_cost = build_pdf_report(session_id, pothole_list, source=source)
         pdf_url = upload_pdf_to_supabase(pdf_path, session_id)
         send_report_email(pdf_path, session_id, total_cost, len(pothole_list), pdf_url=pdf_url)
         write_report_status(session_id, {
-            "status": "ready", "pdf_url": pdf_url, "total_cost": total_cost,
-            "pothole_count": len(pothole_list), "error": None,
+            "status": "ready",
+            "pdf_url": pdf_url,
+            "total_cost": total_cost,
+            "pothole_count": len(pothole_list),
+            "error": None,
         })
-        print(f"[Report] {session_id} ready. URL={pdf_url}", flush=True)
+        print(f"[Report] {session_id} ready. Potholes={len(pothole_list)} Cost=Rs.{total_cost} URL={pdf_url}", flush=True)
     except Exception as e:
         print(f"[Report] generation failed for {session_id}: {e}", flush=True)
+        traceback.print_exc()
         write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
-
-
-@app.get("/health")
-def health_check():
-    return {"backend": "Active", "model": "YOLOv11 Loaded"}
-
-
-@app.get("/api/v1/reports/{session_id}/status")
-def get_report_status(session_id: str):
-    status = read_report_status(session_id)
-    if not status: return {"status": "not_found"}
-    return status
 
 # ===========================================================================
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
