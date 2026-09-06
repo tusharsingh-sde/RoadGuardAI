@@ -14,7 +14,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from dotenv import load_dotenv
@@ -24,7 +24,7 @@ from reportlab.lib import colors
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
 
-load_dotenv()  # .env se saari keys load karta hai (SUPABASE_URL, SENDER_EMAIL, etc.)
+load_dotenv()
 
 app = FastAPI(title="RoadGuard AI Backend", version="1.0")
 
@@ -46,31 +46,25 @@ DRONE_IP_CAM_URL = "http://192.168.1.2:8080/video"
 # ---------------------------------------------------------------------------
 # MAINTENANCE COST ESTIMATION CONFIG
 # ---------------------------------------------------------------------------
-CM_PER_PIXEL = 0.4          # 1 pixel ≈ 0.4 cm on ground (adjust as per camera calibration)
+CM_PER_PIXEL = 0.4
 MIN_DEPTH_CM = 3.0
 MAX_DEPTH_CM = 25.0
-COST_PER_CUBIC_METER_INR = 8500   # PWD-style asphalt/premix patching material rate (₹/m³)
-FIXED_LABOR_COST_INR = 150        # Fixed mobilization + labor cost per pothole
+COST_PER_CUBIC_METER_INR = 8500
+FIXED_LABOR_COST_INR = 150
 
 
 def estimate_pothole_dimensions(x1: float, y1: float, x2: float, y2: float, conf: float):
-    """Bounding box + confidence se width, breadth (cm) aur depth (cm) estimate karta hai."""
     width_px = max(1.0, x2 - x1)
     breadth_px = max(1.0, y2 - y1)
-
     width_cm = round(width_px * CM_PER_PIXEL, 1)
     breadth_cm = round(breadth_px * CM_PER_PIXEL, 1)
-
-    # Depth heuristic: bigger area + higher confidence -> deeper pothole
     area_px = width_px * breadth_px
     depth_cm = 3.0 + (conf ** 2) * 15.0 + (area_px / 6000.0)
     depth_cm = round(min(MAX_DEPTH_CM, max(MIN_DEPTH_CM, depth_cm)), 1)
-
     return width_cm, breadth_cm, depth_cm
 
 
 def calculate_maintenance_cost(width_cm: float, breadth_cm: float, depth_cm: float):
-    """Volume (m³) nikal ke usse material + labor cost calculate karta hai."""
     volume_m3 = (width_cm / 100.0) * (breadth_cm / 100.0) * (depth_cm / 100.0)
     material_cost = volume_m3 * COST_PER_CUBIC_METER_INR
     total_cost = round(FIXED_LABOR_COST_INR + material_cost)
@@ -84,9 +78,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "pothole-reports")
 
-SENDER_EMAIL = os.getenv("SENDER_EMAIL")            # Jis email se report bhejni hai
-SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD")  # Gmail "App Password" (normal password nahi)
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL")               # Jise report receive karni hai
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 
@@ -95,21 +88,19 @@ REPORTS_DIR = "session_reports"
 os.makedirs(CAPTURES_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-report_status: dict = {}
-
+# Unifying Report Status tracking
+report_status = {}
 
 def _status_file_path(session_id: str) -> str:
     return os.path.join(REPORTS_DIR, f"{session_id}.status.json")
 
-
 def write_report_status(session_id: str, data: dict):
-    report_status[session_id] = data  # same-worker fast path
+    report_status[session_id] = data
     try:
         with open(_status_file_path(session_id), "w") as f:
             json.dump(data, f)
     except Exception as e:
         print(f"[Report] failed to persist status file for {session_id}: {e}", flush=True)
-
 
 def read_report_status(session_id: str):
     path = _status_file_path(session_id)
@@ -120,6 +111,7 @@ def read_report_status(session_id: str):
         except Exception as e:
             print(f"[Report] failed to read status file for {session_id}: {e}", flush=True)
     return report_status.get(session_id)
+
 
 supabase_client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -133,15 +125,13 @@ else:
 
 print(
     f"[Config] Supabase configured: {bool(supabase_client)} | "
-    f"Email configured: {bool(SENDER_EMAIL and SENDER_APP_PASSWORD and ADMIN_EMAIL)} | "
+    f"Email configured: {bool(SENDER_EMAIL and SENDER_APP_PASSWORD)} | "
     f"SUPABASE_BUCKET={SUPABASE_BUCKET}",
     flush=True,
 )
 
 
-def save_pothole_context_crop(session_id: str, pothole_id, frame, x1, y1, x2, y2,
-                               margin_ratio: float = 0.6, min_margin_px: int = 30, max_width: int = 640):
-    """Pothole ke around thoda context (padding) rakh ke crop karta hai..."""
+def save_pothole_context_crop(session_id: str, pothole_id, frame, x1, y1, x2, y2, margin_ratio: float = 0.6, min_margin_px: int = 30, max_width: int = 640):
     try:
         h, w = frame.shape[:2]
         bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
@@ -158,7 +148,7 @@ def save_pothole_context_crop(session_id: str, pothole_id, frame, x1, y1, x2, y2
         crop = frame[cy1:cy2, cx1:cx2].copy()
         box_x1, box_y1 = int(x1 - cx1), int(y1 - cy1)
         box_x2, box_y2 = int(x2 - cx1), int(y2 - cy1)
-        cv2.rectangle(crop, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)  # BGR red
+        cv2.rectangle(crop, (box_x1, box_y1), (box_x2, box_y2), (0, 0, 255), 3)
 
         ch, cw = crop.shape[:2]
         if cw > max_width:
@@ -176,7 +166,6 @@ def save_pothole_context_crop(session_id: str, pothole_id, frame, x1, y1, x2, y2
 
 
 def build_pdf_report(session_id: str, pothole_list: list, source: str = "Live Drone Stream"):
-    """Branded, styled PDF report..."""
     pdf_path = os.path.join(REPORTS_DIR, f"{session_id}.pdf")
     doc = SimpleDocTemplate(
         pdf_path, pagesize=A4,
@@ -328,7 +317,6 @@ def build_pdf_report(session_id: str, pothole_list: list, source: str = "Live Dr
 
 
 def upload_pdf_to_supabase(pdf_path: str, session_id: str):
-    """PDF ko Supabase Storage bucket me upload karke public URL return karta hai."""
     if not supabase_client:
         return None
     remote_path = f"{session_id}.pdf"
@@ -346,15 +334,14 @@ def upload_pdf_to_supabase(pdf_path: str, session_id: str):
         return None
 
 
-def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count: int, pdf_url: str = None):
-    """Admin ko ek branded HTML email bhejta hai, PDF attachment ke saath."""
-    if not (SENDER_EMAIL and SENDER_APP_PASSWORD and ADMIN_EMAIL):
-        print("[Email] SENDER_EMAIL/SENDER_APP_PASSWORD/ADMIN_EMAIL missing in .env — skipping email.", flush=True)
+def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count: int, receiver_email: str, pdf_url: str = None):
+    if not (SENDER_EMAIL and SENDER_APP_PASSWORD and receiver_email):
+        print(f"[Email] Skipping: Sender({bool(SENDER_EMAIL)}) AppPass({bool(SENDER_APP_PASSWORD)}) Receiver({bool(receiver_email)})", flush=True)
         return False
     try:
         msg = MIMEMultipart("alternative")
         msg["From"] = SENDER_EMAIL
-        msg["To"] = ADMIN_EMAIL
+        msg["To"] = receiver_email
         msg["Subject"] = f"RoadGuard AI Report — {pothole_count} potholes, Rs. {total_cost}"
 
         text_body = (
@@ -449,19 +436,19 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.send_message(msg)
+        print(f"[Email] Sent successfully to {receiver_email}", flush=True)
         return True
     except Exception as e:
         print(f"[Email] sending failed: {e}", flush=True)
         return False
 
 
-def process_session_report(session_id: str, pothole_list: list, source: str):
-    """PDF banata hai, Supabase pe upload karta hai, aur admin ko email karta hai."""
-    write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
+def process_session_report(session_id: str, pothole_list: list, source: str, receiver_email: str):
     try:
         pdf_path, total_cost = build_pdf_report(session_id, pothole_list, source=source)
         pdf_url = upload_pdf_to_supabase(pdf_path, session_id)
-        send_report_email(pdf_path, session_id, total_cost, len(pothole_list), pdf_url=pdf_url)
+        
+        send_report_email(pdf_path, session_id, total_cost, len(pothole_list), receiver_email=receiver_email, pdf_url=pdf_url)
         write_report_status(session_id, {
             "status": "ready",
             "pdf_url": pdf_url,
@@ -479,7 +466,7 @@ def process_session_report(session_id: str, pothole_list: list, source: str):
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
 # ===========================================================================
 @app.websocket("/ws/drone-stream")
-async def drone_stream_websocket(websocket: WebSocket):
+async def drone_stream_websocket(websocket: WebSocket, email: str = None):
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
     
@@ -577,11 +564,11 @@ async def drone_stream_websocket(websocket: WebSocket):
         pothole_list = list(session_pothole_data.values())
         total = sum(p["cost"] for p in pothole_list)
         print(f"Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list:
+        if pothole_list and email:
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Live IP Camera"), daemon=True
+                    target=process_session_report, args=(session_id, pothole_list, "Live IP Camera", email), daemon=True
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
@@ -589,25 +576,18 @@ async def drone_stream_websocket(websocket: WebSocket):
 # ===========================================================================
 # 2. PUSH MODEL (NEW USP): WEBSOCKET FOR DEVICE BROWSER CAMERA
 # ===========================================================================
-# Comment for reference: Frontend canvas base64 image bytes ko yaha bhejta hai. 
-# OpenCV decode karta hai, YOLO lagata hai, aur same JSON UI ko bhej deta hai.
 @app.websocket("/ws/device-stream")
-async def device_stream_websocket(websocket: WebSocket):
+async def device_stream_websocket(websocket: WebSocket, email: str = None):
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
     print(f"Connecting to Device Browser Camera Stream | session_id={session_id}", flush=True)
-    
     session_pothole_data = {}
-
     try:
         while True:
-            # 1. Catch Base64 frame from frontend (Canvas)
             data = await websocket.receive_json()
             base64_str = data.get("frame")
             if not base64_str:
                 continue
-
-            # 2. Decode the Base64 String back to an OpenCV Image (NumPy Array)
             header, encoded = base64_str.split(",", 1) if "," in base64_str else ("", base64_str)
             img_bytes = base64.b64decode(encoded)
             np_arr = np.frombuffer(img_bytes, np.uint8)
@@ -615,25 +595,22 @@ async def device_stream_websocket(websocket: WebSocket):
 
             if frame is None:
                 continue
-
-            # 3. Exactly same YOLO + ByteTrack Logic as the IP stream
+            
             results = model.track(frame, tracker="bytetrack.yaml", persist=True, conf=0.60, verbose=False)
             annotated_frame = results[0].plot()
-
             detections = []
             critical, high, medium = 0, 0, 0
             boxes = results[0].boxes
-            
+
             if boxes is not None:
                 for box in boxes:
                     x1, y1, x2, y2 = box.xyxy[0].tolist()
                     conf = float(box.conf[0])
                     track_id = int(box.id[0]) if box.id is not None else None
-                    
+
                     if conf >= 0.85: critical += 1
                     elif conf >= 0.75: high += 1
                     else: medium += 1
-
                     width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
                     pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
 
@@ -650,32 +627,26 @@ async def device_stream_websocket(websocket: WebSocket):
                             "breadth_cm": breadth_cm, "depth_cm": depth_cm,
                             "cost": pothole_cost, "image_path": image_path,
                         }
-
                     detections.append({
                         "id": track_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                         "confidence": conf, "width_cm": width_cm, "breadth_cm": breadth_cm,
                         "depth_cm": depth_cm, "volume_m3": volume_m3, "estimated_cost": pothole_cost
                     })
-
-            # 4. Re-encode to send back to frontend
+                    
             _, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             out_base64 = base64.b64encode(buffer).decode("utf-8")
-
             session_total_cost = sum(p["cost"] for p in session_pothole_data.values())
-
-            # 5. Push payload exactly like Drone stream
+            
             payload = {
                 "session_id": session_id,
                 "image": f"data:image/jpeg;base64,{out_base64}",
                 "count": len(detections), "critical": critical, "high": high, "medium": medium,
-                "estimated_cost": len(detections) * 250, 
+                "estimated_cost": len(detections) * 250,
                 "session_total_maintenance_cost": session_total_cost,
                 "session_unique_potholes": len(session_pothole_data),
                 "detections": detections
             }
-
             await websocket.send_json(payload)
-
     except WebSocketDisconnect:
         print("Frontend disconnected from Device Stream.", flush=True)
     except Exception as e:
@@ -684,21 +655,22 @@ async def device_stream_websocket(websocket: WebSocket):
         pothole_list = list(session_pothole_data.values())
         total = sum(p["cost"] for p in pothole_list)
         print(f"Device Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list:
+        if pothole_list and email:
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Local Device Browser Camera"), daemon=True
+                    target=process_session_report, args=(session_id, pothole_list, "Local Device Browser Camera", email), daemon=True
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
-
+        elif not email:
+            print(f"[Warning] Session {session_id} ended without email in URL. Skipping report generation.", flush=True)
 
 # ===========================================================================
 # 3. BATCH UPLOAD FOR LARGE 100MB+ RECORDED VIDEOS
 # ===========================================================================
 @app.post("/api/v1/analyze-video")
-async def analyze_video(file: UploadFile = File(...)):
+async def analyze_video(file: UploadFile = File(...), email: str = None):
     file_ext = file.filename.split('.')[-1]
     unique_filename = f"{uuid.uuid4()}.{file_ext}"
     file_path = f"temp_uploads/{unique_filename}"
@@ -752,11 +724,11 @@ async def analyze_video(file: UploadFile = File(...)):
     cap.release()
     os.remove(file_path)
 
-    if pothole_dimensions:
+    if pothole_dimensions and email:
         write_report_status(batch_session_id, {"status": "processing", "pdf_url": None, "error": None})
         threading.Thread(
             target=process_session_report,
-            args=(batch_session_id, pothole_dimensions, "Batch Video Upload"),
+            args=(batch_session_id, pothole_dimensions, "Batch Video Upload", email),
             daemon=True,
         ).start()
 
@@ -765,3 +737,13 @@ async def analyze_video(file: UploadFile = File(...)):
         "total_potholes": total_potholes, "severity_breakdown": {"critical": critical, "high": high, "medium": medium},
         "estimated_cost_inr": total_maintenance_cost, "pothole_dimensions": pothole_dimensions
     }
+
+# ===========================================================================
+# 4. REPORT STATUS API
+# ===========================================================================
+@app.get("/api/v1/reports/{session_id}/status")
+def get_report_status(session_id: str):
+    status_data = read_report_status(session_id)
+    if not status_data:
+        raise HTTPException(status_code=404, detail="Report status not found")
+    return status_data

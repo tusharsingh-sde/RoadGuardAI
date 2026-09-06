@@ -181,7 +181,7 @@ export default function DashboardPage() {
     if (wsRef.current) wsRef.current.close();
     setReportState({ status: "idle" });
 
-    const socket = new WebSocket(BACKEND_WS);
+    const socket = new WebSocket(`${BACKEND_DEVICE_WS}?email=${user?.email}`);
     wsRef.current = socket;
 
     socket.onopen = () => {
@@ -229,7 +229,7 @@ export default function DashboardPage() {
       }
 
       setReportState({ status: "idle" });
-      const socket = new WebSocket(BACKEND_DEVICE_WS);
+      const socket = new WebSocket(`${BACKEND_DEVICE_WS}?email=${user?.email}`);
       wsRef.current = socket;
 
       socket.onopen = () => {
