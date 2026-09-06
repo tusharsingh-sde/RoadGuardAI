@@ -399,6 +399,9 @@ export default function DashboardPage() {
     setMediumCount(0);
     setCurrentSessionId(null);
     setReportState({ status: "idle" });
+    if (fileUploadRef.current) {
+      fileUploadRef.current.value = "";
+    }
   };
 
   const handleLogout = async () => {
