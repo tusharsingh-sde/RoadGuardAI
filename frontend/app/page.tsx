@@ -651,29 +651,32 @@ function LiveDetectionView(props: {
             </div>
           </div>
 
-          <div className="camera-screen" style={{ position: "relative" }}>
-            {isUploading && (
-              <div style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.8)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 50, borderRadius: "8px" }}>
-                <div className="spinner" style={{ border: "4px solid #f3f3f3", borderTop: "4px solid #1a7d43", borderRadius: "50%", width: "40px", height: "40px", animation: "spin 1s linear infinite" }}></div>
+          {/* Camera Screen with Solid Loading State */}
+          <div className="camera-screen" style={{ position: "relative", overflow: "hidden" }}>
+            
+            {isUploading ? (
+              // SOLID DARK BACKGROUND LOADER (No transparency, hides everything behind it)
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "#1e293b", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 50, borderRadius: "8px" }}>
+                <div className="spinner" style={{ border: "4px solid #334155", borderTop: "4px solid #1a7d43", borderRadius: "50%", width: "40px", height: "40px", animation: "spin 1s linear infinite" }}></div>
                 <p style={{ color: "white", marginTop: "15px", fontWeight: "bold" }}>{uploadProgressText}</p>
                 <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
-               </div>
-             )}
-
-            {isAnyStreamActive && droneImageSrc ? (
+              </div>
+            ) : isAnyStreamActive && droneImageSrc ? (
+              // LIVE VIDEO FEED
               <img src={droneImageSrc} alt="Live road feed" className="road-video" />
             ) : (
+              // PLACEHOLDER (IP Input) - Ye ab tabhi dikhega jab upload NAHI ho raha hoga
               <div className="camera-placeholder">
-                <div className="camera-icon">{"📹"}</div>
+                <div className="camera-icon">{"\uD83D\uDCF9"}</div>
                 <h3>Camera / Video Feed</h3>
                 <p>Enter an IP address or use your local device camera to begin inspection</p>
                 <div style={{ margin: "12px 0", width: "80%", maxWidth: "360px", display: "flex", gap: "10px", flexDirection: "column" }}>
-                  <input
-                    type="text"
-                    className="ip-input"
-                    value={ipCamUrl}
-                    onChange={(e) => setIpCamUrl(e.target.value)}
-                    placeholder="http://192.168.1.100:8080/video or 0"
+                  <input 
+                    type="text" 
+                    className="ip-input" 
+                    value={ipCamUrl} 
+                    onChange={(e) => setIpCamUrl(e.target.value)} 
+                    placeholder="http://192.168.1.100:8080/video or 0" 
                   />
                 </div>
               </div>
