@@ -716,7 +716,7 @@ async def analyze_video(file: UploadFile = File(...), email: str = None):
                     pothole_dimensions.append({
                         "id": pothole_label, "frame": frame_count, "confidence": conf,
                         "width_cm": width_cm, "breadth_cm": breadth_cm, "depth_cm": depth_cm,
-                        "volume_m3": volume_m3, "estimated_cost": pothole_cost, "image_path": image_path,
+                        "volume_m3": volume_m3, "estimated_cost": pothole_cost,"cost": pothole_cost, "image_path": image_path,
                     })
                     
         frame_count += 1

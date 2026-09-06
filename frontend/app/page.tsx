@@ -325,13 +325,13 @@ export default function DashboardPage() {
     formData.append("file", file);
 
     try {
-      const response = await fetch(`${BACKEND_HTTP}/api/v1/analyze-video`, {
+      const res = await fetch(`${BACKEND_HTTP}/api/v1/analyze-video?email=${user?.email}`,{
         method: "POST",
         body: formData,
       });
-      const data = await response.json();
+      const data = await res.json();
 
-      if (response.ok) {
+      if (res.ok) {
         alert(`Batch Analysis Complete!\nTotal Potholes: ${data.total_potholes}\nTotal Maintenance Cost: ₹${data.estimated_cost_inr}`);
         setDetectionCount(data.total_potholes);
         setCriticalCount(data.severity_breakdown.critical);
