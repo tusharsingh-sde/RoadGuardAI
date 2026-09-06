@@ -52,6 +52,11 @@ export default function DashboardPage() {
   const [mediumCount, setMediumCount] = useState(0);
   const [sessionCost, setSessionCost] = useState(0);
 
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgressText, setUploadProgressText] = useState("");
+  const fileUploadRef = useRef<HTMLInputElement | null>(null);
+  const [showCompletionModal, setShowCompletionModal] = useState(false);
+
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [reportState, setReportState] = useState<{
     status: "idle" | "processing" | "ready" | "error" | "timeout";
@@ -319,7 +324,10 @@ export default function DashboardPage() {
 
     stopDroneStream();
     stopDeviceCamera();
-    alert("Uploading recorded video to server for batch processing...");
+
+    // Custom Loading State Start
+    setIsUploading(true);
+    setUploadProgressText("Uploading and analyzing video... This may take a minute.");
 
     const formData = new FormData();
     formData.append("file", file);
@@ -332,7 +340,12 @@ export default function DashboardPage() {
       const data = await res.json();
 
       if (res.ok) {
-        alert(`Batch Analysis Complete!\nTotal Potholes: ${data.total_potholes}\nTotal Maintenance Cost: ₹${data.estimated_cost_inr}`);
+        setIsUploading(false);
+        setUploadProgressText(" Upload complete! Processing results...");
+        // Custom Modal Notification (Native alert replaced with a clean timeout-based UI alert if you want, or just a modern alert for now till we build a full modal component)
+        // For now, let's keep it simple without freezing the browser thread
+        setShowCompletionModal(true);
+
         setDetectionCount(data.total_potholes);
         setCriticalCount(data.severity_breakdown.critical);
         setHighCount(data.severity_breakdown.high);
@@ -359,7 +372,8 @@ export default function DashboardPage() {
         setHistoricalLogs(batchLogs);
       }
     } catch (error) {
-      alert("Upload failed. Ensure backend is running.");
+      setIsUploading(false);
+      setTimeout(() => alert("Upload failed. Ensure backend is running."), 100);
     }
   };
 
@@ -490,6 +504,9 @@ export default function DashboardPage() {
             resetSession={resetSession}
             deviceVideoRef={deviceVideoRef}
             hiddenCanvasRef={hiddenCanvasRef}
+            isUploading= {isUploading}
+            uploadProgressText={uploadProgressText}
+            fileUploadRef={fileUploadRef}
           />
         )}
 
@@ -504,12 +521,36 @@ export default function DashboardPage() {
         {activeView === "history" && (
           <HistoryView historicalLogs={historicalLogs} isAnyStreamActive={isAnyStreamActive} />
         )}
+
+        {/* Custom Completion Modal */}
+        {showCompletionModal && (
+          <div style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999, backdropFilter: "blur(4px)" }}>
+            <div style={{ background: "#1e293b", padding: "30px", borderRadius: "12px", textAlign: "center", color: "white", width: "350px", boxShadow: "0 10px 25px rgba(0,0,0,0.5)", animation: "popIn 0.3s ease-out" }}>
+              <div style={{ fontSize: "48px", marginBottom: "15px" }}>✅</div>
+              <h2 style={{ margin: "0 0 10px 0", color: "#4ade80" }}>Batch Analysis Complete</h2>
+              <div style={{ background: "#0f172a", padding: "15px", borderRadius: "8px", marginBottom: "20px" }}>
+                <p style={{ margin: "5px 0", color: "#94a3b8" }}>Total Potholes: <strong style={{ color: "white", fontSize: "1.1rem" }}>{detectionCount}</strong></p>
+                <p style={{ margin: "5px 0", color: "#94a3b8" }}>Maintenance Cost: <strong style={{ color: "#fbbf24", fontSize: "1.1rem" }}>₹{sessionCost}</strong></p>
+              </div>
+              <button
+                onClick={() => setShowCompletionModal(false)}
+                style={{ background: "#1a7d43", color: "white", border: "none", padding: "12px 20px", borderRadius: "6px", cursor: "pointer", fontWeight: "bold", width: "100%", fontSize: "1rem" }}
+              >
+                View Report Dashboard
+              </button>
+              <style>{`@keyframes popIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }`}</style>
+            </div>
+          </div>
+        )}
       </section>
     </main>
   );
 }
 
 function LiveDetectionView(props: {
+  isUploading: boolean;
+  uploadProgressText: string;
+  fileUploadRef: React.RefObject<HTMLInputElement | null>;
   isAnyStreamActive: boolean;
   isStreamingDrone: boolean;
   isStreamingDevice: boolean;
@@ -534,6 +575,9 @@ function LiveDetectionView(props: {
   hiddenCanvasRef: React.RefObject<HTMLCanvasElement | null>;
 }) {
   const {
+    isUploading,
+    uploadProgressText,
+    fileUploadRef,
     isAnyStreamActive,
     isStreamingDrone,
     isStreamingDevice,
@@ -607,7 +651,15 @@ function LiveDetectionView(props: {
             </div>
           </div>
 
-          <div className="camera-screen">
+          <div className="camera-screen" style={{ position: "relative" }}>
+            {isUploading && (
+              <div style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.8)", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", zIndex: 50, borderRadius: "8px" }}>
+                <div className="spinner" style={{ border: "4px solid #f3f3f3", borderTop: "4px solid #1a7d43", borderRadius: "50%", width: "40px", height: "40px", animation: "spin 1s linear infinite" }}></div>
+                <p style={{ color: "white", marginTop: "15px", fontWeight: "bold" }}>{uploadProgressText}</p>
+                <style>{`@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }`}</style>
+               </div>
+             )}
+
             {isAnyStreamActive && droneImageSrc ? (
               <img src={droneImageSrc} alt="Live road feed" className="road-video" />
             ) : (
@@ -628,13 +680,27 @@ function LiveDetectionView(props: {
             )}
           </div>
 
+          {/* Hidden File Input */}
+          <input 
+            type="file" 
+            accept="video/*" 
+            ref={fileUploadRef} 
+            style={{ display: "none" }} 
+            onChange={handleBulkUpload} 
+          />
+
           <div className="session-controls-row" style={{ flexWrap: "wrap", gap: "10px" }}>
-            <button className="btn btn-primary" onClick={startDroneStream} disabled={isAnyStreamActive}>
+            <button className="btn btn-primary" onClick={startDroneStream} disabled={isAnyStreamActive || isUploading}>
               {"📹"} Start IP/USB Cam
             </button>
-            <button className="btn btn-secondary" onClick={startDeviceCamera} disabled={isAnyStreamActive} style={{ backgroundColor: "#2d3748", color: "white" }}>
+            <button className="btn btn-secondary" onClick={startDeviceCamera} disabled={isAnyStreamActive || isUploading} style={{ backgroundColor: "#2d3748", color: "white" }}>
               {"📱"} Use Device Camera
             </button>
+            {/* NAYA BUTTON */}
+            <button className="btn btn-secondary" onClick={() => fileUploadRef.current?.click()} disabled={isAnyStreamActive || isUploading} style={{ backgroundColor: "#1a7d43", color: "white" }}>
+              {"📂"} Upload Video
+            </button>
+
             <button className="btn btn-danger" onClick={endSession} disabled={!isAnyStreamActive}>
               {"■"} End Session
             </button>
