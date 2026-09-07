@@ -4,10 +4,9 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/AuthProvider";
 
-const BACKEND_HTTP = "http://127.0.0.1:8000";
-const BACKEND_WS = "ws://127.0.0.1:8000/ws/drone-stream";
-// Naya WebSocket endpoint device camera ke liye
-const BACKEND_DEVICE_WS = "ws://127.0.0.1:8000/ws/device-stream";
+const BACKEND_HTTP = process.env.NEXT_PUBLIC_BACKEND_HTTP || "http://127.0.0.1:8000";
+const BACKEND_WS = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://127.0.0.1:8000/ws/drone-stream";
+const BACKEND_DEVICE_WS = process.env.NEXT_PUBLIC_BACKEND_DEVICE_WS || "ws://127.0.0.1:8000/ws/device-stream";
 
 type SidebarView = "live" | "history" | "uploads" | "reports";
 
@@ -34,7 +33,7 @@ export default function DashboardPage() {
   const streamIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const isWaitingForBackendRef = useRef(false);
 
-  const [ipCamUrl, setIpCamUrl] = useState("http://192.168.1.2:8080/video");
+  const [ipCamUrl, setIpCamUrl] = useState("http://192.168.1.3:8080/video");
   const [isStreamingDrone, setIsStreamingDrone] = useState(false);
   const [isStreamingDevice, setIsStreamingDevice] = useState(false);
   const [droneImageSrc, setDroneImageSrc] = useState<string | null>(null);
@@ -222,6 +221,9 @@ export default function DashboardPage() {
 
   // New USP: Device Camera PUSH Logic (Resizing + Compression)
   const startDeviceCamera = async () => {
+    stopDroneStream();
+    stopDeviceCamera();
+    
     try {
       console.log("[Cam] Requesting camera access...");
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -321,6 +323,7 @@ export default function DashboardPage() {
   const handleBulkUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
+    event.target.value = "";
 
     stopDroneStream();
     stopDeviceCamera();
