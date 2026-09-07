@@ -186,7 +186,7 @@ export default function DashboardPage() {
     if (wsRef.current) wsRef.current.close();
     setReportState({ status: "idle" });
 
-    const socket = new WebSocket(`${BACKEND_DEVICE_WS}?email=${user?.email}`);
+    const socket = new WebSocket(`${BACKEND_WS}?email=${user?.email}`);
     wsRef.current = socket;
 
     socket.onopen = () => {
