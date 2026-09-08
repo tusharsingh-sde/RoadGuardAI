@@ -1,0 +1,13 @@
+# Dynamic Caddyfile for any Azure VM IP (via nip.io)
+{
+    on_demand_tls {
+        ask http://localhost:5555/check
+    }
+}
+
+:443 {
+    tls {
+        on_demand
+    }
+    reverse_proxy frontend:100
+}

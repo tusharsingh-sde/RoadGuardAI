@@ -1,20 +1,48 @@
 "use client";
 
+import dynamic from 'next/dynamic';
+
+// Map ko dynamically load karna taaki server side render par na fate
+const PotholeMap = dynamic(() => import('./PotholeMap'), {
+  ssr: false,
+  loading: () => <div style={{ height: "300px", background: "#1e293b", display: "flex", alignItems: "center", justifyContent: "center", borderRadius: "8px" }}>Loading Map...</div>
+});
+
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/supabase/AuthProvider";
+import { getSupabaseClient } from "@/lib/supabase/client";
+const supabase = getSupabaseClient();
+// Smart Environment Check
+const isLocalDev = typeof window !== 'undefined' && window.location.hostname === 'localhost';
 
-const BACKEND_HTTP = process.env.NEXT_PUBLIC_BACKEND_HTTP || "http://127.0.0.1:8000";
-const BACKEND_WS = process.env.NEXT_PUBLIC_BACKEND_WS || "ws://127.0.0.1:8000/ws/drone-stream";
-const BACKEND_DEVICE_WS = process.env.NEXT_PUBLIC_BACKEND_DEVICE_WS || "ws://127.0.0.1:8000/ws/device-stream";
+// HTTP Base URL (Local = 8000, Prod = Relative for Nginx)
+const BACKEND_HTTP = isLocalDev ? "http://127.0.0.1:8000" : "";
+
+// WebSocket Base URL
+const getWsUrl = () => {
+  if (typeof window === "undefined") return "";
+  
+  // Localhost par seedha backend port par bhej
+  if (isLocalDev) return "ws://127.0.0.1:8000";
+  
+  // Production (Azure VM) par Nginx ke liye relative path
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}`;
+};
+
+const BASE_WS = getWsUrl();
+
+const BACKEND_WS = `${BASE_WS}/ws/drone-stream`;
+const BACKEND_DEVICE_WS = `${BASE_WS}/ws/device-stream`;
 
 type SidebarView = "live" | "history" | "uploads" | "reports";
 
 const NAV_ITEMS: { key: SidebarView; label: string; icon: string }[] = [
   { key: "live", label: "Live Detection", icon: "◉" },
-  { key: "history", label: "History", icon: "◷" },
+  { key: "history", label: "History", icon: "🕒" },
   { key: "uploads", label: "Video Uploads", icon: "☁" },
-  { key: "reports", label: "PDFs / Reports", icon: "▥" },
+  { key: "reports", label: "PDFs / Reports", icon: "📄" },
 ];
 
 export default function DashboardPage() {
@@ -380,9 +408,35 @@ export default function DashboardPage() {
     }
   };
 
-  const endSession = () => {
+  const endSession = async () => {
+  // 1. Pehle streams roko 
     stopDroneStream();
     stopDeviceCamera();
+
+    // 2. Supabase mein session data push karo
+    try {
+      const { error } = await supabase
+        .from('session_history') // Apni Supabase table ka exact naam check kar lena
+        .insert([
+          {
+            // Demo safety: Agar address variable yahan undefined hua, toh app crash na ho isliye fallback
+            location_address: "Live PWD Zone, NH58, Meerut", 
+            total_potholes: detectionCount,
+            estimated_cost: sessionCost,
+            session_date: new Date().toISOString()
+          }
+        ]);
+
+      if (error) {
+        console.error("Database save failed:", error);
+      } else {
+        console.log("Session saved to History!");
+      }
+    } catch (err) {
+      console.error("Supabase Error:", err);
+    }
+
+    // 3. UI states reset karo (teri purani lines)
     setSessionStarted(false);
     setSessionSeconds(0);
     setDetections([]);
@@ -705,7 +759,7 @@ function LiveDetectionView(props: {
             <button className="btn btn-secondary" onClick={startDeviceCamera} disabled={isAnyStreamActive || isUploading} style={{ backgroundColor: "#2d3748", color: "white" }}>
               {"📱"} Use Device Camera
             </button>
-            {/* NAYA BUTTON */}
+            {/* upload video button */}
             <button className="btn btn-secondary" onClick={() => fileUploadRef.current?.click()} disabled={isAnyStreamActive || isUploading} style={{ backgroundColor: "#1a7d43", color: "white" }}>
               {"📂"} Upload Video
             </button>
@@ -807,6 +861,11 @@ function LiveDetectionView(props: {
       </section>
 
       <ReportPanel reportState={reportState} sessionCost={sessionCost} detectionCount={detectionCount} isAnyStreamActive={isAnyStreamActive} />
+      
+      {/* LIVE MAP CONTAINER */}
+      <div style={{ height: "400px", marginTop: "16px", borderRadius: "8px", overflow: "hidden" }}>
+        <PotholeMap historicalLogs={historicalLogs} />
+      </div>
 
       <section className="panel session-card" style={{ marginTop: 16 }}>
         <div className="card-header">
