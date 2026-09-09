@@ -91,7 +91,7 @@ export default function LoginPage() {
     <div className="login-shell">
       <section className="login-hero">
         <div className="brand">
-          <div className="brand-logo">{"\u{1F6E1}\uFE0F"}</div>
+          <div className="brand-logo">{"\u{1F6E3}\uFE0F"}</div>
           <div>
             <h1>
               RoadGuard <span>AI</span>
