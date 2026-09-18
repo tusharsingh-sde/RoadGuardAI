@@ -380,7 +380,7 @@ export default function DashboardPage() {
         setDetectionCount(data.total_potholes);
         setCriticalCount(data.severity_breakdown.critical);
         setHighCount(data.severity_breakdown.high);
-        setMediumCount(data.severity_breakdown.medium);
+        setMediumCount(data.severity_breakdown.medium); 
         setSessionCost(data.estimated_cost_inr);
 
         if (data.session_id) {
@@ -1101,3 +1101,9 @@ function HistoryView({
     </>
   );
 }
+
+
+
+
+
+
