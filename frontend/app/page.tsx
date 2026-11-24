@@ -502,7 +502,13 @@ export default function DashboardPage() {
         },
       ]);
       if (error) {
-        console.error("Database save failed:", error);
+        console.error(
+          "Database save failed:",
+          error.code,
+          error.message,
+          error.details,
+          error.hint
+        );
       } else {
         setHistoryRefreshKey((k) => k + 1);
       }
