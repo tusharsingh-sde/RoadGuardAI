@@ -24,6 +24,7 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [googleSubmitting, setGoogleSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [confirmationSent, setConfirmationSent] = useState(false);
 
@@ -84,6 +85,19 @@ export default function LoginPage() {
       }
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setFormError(null);
+    setGoogleSubmitting(true);
+    try {
+      await signInWithGoogle();
+    } catch (err) {
+      setFormError(
+        err instanceof Error ? err.message : "Google sign-in failed. Please try again."
+      );
+      setGoogleSubmitting(false);
     }
   };
 
@@ -206,9 +220,14 @@ export default function LoginPage() {
             <span>or</span>
           </div>
 
-          <button className="google-btn" onClick={signInWithGoogle}>
+          <button
+            type="button"
+            className="google-btn"
+            onClick={handleGoogleSignIn}
+            disabled={submitting || googleSubmitting}
+          >
             <GoogleIcon />
-            Continue with Google
+            {googleSubmitting ? "Redirecting to Google…" : "Continue with Google"}
           </button>
 
           <p className="login-domain-note">

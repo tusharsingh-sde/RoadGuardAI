@@ -27,3 +27,7 @@ __pycache__/
 backend/temp_uploads/
 backend/session_captures/
 backend/session_reports/
+
+*.tsbuildinfo
+out/
+frontend/out/

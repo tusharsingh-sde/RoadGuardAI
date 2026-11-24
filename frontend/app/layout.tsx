@@ -18,7 +18,11 @@ export const metadata: Metadata = {
   description: "AI-powered pothole detection and road condition monitoring",
 };
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
   return (
     <html
       lang="en"
