@@ -1,7 +1,7 @@
 services:
   backend:
     build: ./backend
-    container_name: back-nitin
+    container_name: roadguard-backend
     env_file:
       - ./backend/.env
     restart: unless-stopped
@@ -14,7 +14,7 @@ services:
         NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
         NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN: ${NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN:-miet.ac.in}
         NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-}
-    container_name: front-nitin
+    container_name: roadguard-frontend
     expose:
       - "100"
     depends_on:
@@ -24,7 +24,7 @@ services:
 
   caddy:
     image: caddy:alpine
-    container_name: caddy-nitin
+    container_name: roadguard-caddy
     restart: unless-stopped
     ports:
       - "80:80"
@@ -34,7 +34,10 @@ services:
       - caddy_data:/data
       - caddy_config:/config
     depends_on:
-      - frontend
+      frontend:
+        condition: service_started
+      backend:
+        condition: service_healthy
 
 volumes:
   caddy_data:
