@@ -53,7 +53,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // This is a UX-level check only — the real trusted-layer restriction
       // must be enforced in Supabase itself (see supabase/sql/restrict_email_domain.sql).
       setErrorMessage(
-        "You are not eligible to access RoadGuard AI. Please use your @miet.ac.in Google account."
+        `You are not eligible to access RoadGuard AI. Please use your @${ALLOWED_EMAIL_DOMAIN} account.`
       );
       const supabase = getSupabaseClient();
       await supabase.auth.signOut();
@@ -99,6 +99,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     });
     if (error) {
       setErrorMessage(error.message);
+      throw new Error(error.message);
     }
   }, []);
 
