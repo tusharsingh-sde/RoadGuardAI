@@ -7,6 +7,8 @@ import ipaddress
 import cv2
 import numpy as np
 import os
+import shutil
+import time
 import uuid
 import base64
 import asyncio
@@ -16,6 +18,8 @@ import json
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -32,7 +36,53 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 
 load_dotenv()
 
-app = FastAPI(title="RoadGuard AI Backend", version="1.0")
+SMTP_TIMEOUT_SECONDS = int(os.getenv("SMTP_TIMEOUT_SECONDS", "20"))
+REPORT_TTL_HOURS = int(os.getenv("REPORT_TTL_HOURS", "24"))
+REPORT_WORKERS = max(1, int(os.getenv("REPORT_WORKERS", "2")))
+
+report_executor: ThreadPoolExecutor | None = None
+
+
+def get_report_executor() -> ThreadPoolExecutor:
+    global report_executor
+    if report_executor is None:
+        report_executor = ThreadPoolExecutor(
+            max_workers=REPORT_WORKERS,
+            thread_name_prefix="report-worker",
+        )
+    return report_executor
+
+
+async def _periodic_cleanup_loop():
+    while True:
+        await asyncio.sleep(3600)  # Har 1 ghante mein expired files clean hon
+        try:
+            await asyncio.to_thread(cleanup_expired_files)
+        except Exception as e:
+            print(f"[Cleanup] Periodic cleanup error: {e}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    get_report_executor()
+    await asyncio.to_thread(cleanup_expired_files)
+    cleanup_task = asyncio.create_task(_periodic_cleanup_loop())
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            pass
+        global report_executor
+        if report_executor is not None:
+            print("[Shutdown] Waiting for in-flight PDF/email report jobs to finish...", flush=True)
+            report_executor.shutdown(wait=True)
+            report_executor = None
+
+
+app = FastAPI(title="RoadGuard AI Backend", version="1.0", lifespan=lifespan)
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -351,7 +401,7 @@ def build_pdf_report(session_id: str, pothole_list: list, source: str = "Live Dr
         return "MEDIUM", MEDIUM
 
     header_table = Table(
-        [[Paragraph("🛣  RoadGuard AI", title_style),
+        [[Paragraph("RoadGuard AI", title_style),
           Paragraph(datetime.now().strftime("%d %b %Y, %I:%M %p"), subtitle_style)]],
         colWidths=[13 * cm, 5.5 * cm],
     )
@@ -597,10 +647,12 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
         part.add_header("Content-Disposition", f"attachment; filename={session_id}.pdf")
         msg.attach(part)
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT_SECONDS) as server:
+            server.ehlo()
             server.starttls()
+            server.ehlo()
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
-            server.send_message(msg)
+            server.send_message(msg, from_addr=SENDER_EMAIL, to_addrs=recipients)
         print(f"[Email] Sent successfully to {', '.join(recipients)}", flush=True)
         return True
     except Exception as e:
@@ -608,24 +660,129 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
         return False
 
 
+def cleanup_session_captures(session_id: str):
+    """Remove per-session raw crop images once PDF generation finishes or is skipped."""
+    try:
+        safe_id = validate_session_id(session_id)
+        session_dir = os.path.join(CAPTURES_DIR, safe_id)
+        if os.path.isdir(session_dir):
+            shutil.rmtree(session_dir, ignore_errors=True)
+    except Exception as e:
+        print(f"[Cleanup] failed to remove captures for {session_id}: {e}", flush=True)
+
+
+def cleanup_expired_files():
+    """Delete expired reports, status files, stray capture folders, and stale uploads."""
+    now = time.time()
+    report_cutoff = now - (REPORT_TTL_HOURS * 3600)
+    upload_cutoff = now - (2 * 3600)  # Stray temp uploads older than 2h
+    removed_files = 0
+
+    # 1. Clean expired PDFs & status JSONs in session_reports/
+    if os.path.isdir(REPORTS_DIR):
+        for name in os.listdir(REPORTS_DIR):
+            full_path = os.path.join(REPORTS_DIR, name)
+            try:
+                if os.path.isfile(full_path) and os.path.getmtime(full_path) < report_cutoff:
+                    os.remove(full_path)
+                    removed_files += 1
+                    if name.endswith(".status.json"):
+                        sid = name.removesuffix(".status.json")
+                        report_status.pop(sid, None)
+            except Exception as e:
+                print(f"[Cleanup] failed to delete {full_path}: {e}", flush=True)
+
+    # 2. Clean stray capture folders in session_captures/
+    if os.path.isdir(CAPTURES_DIR):
+        for name in os.listdir(CAPTURES_DIR):
+            full_path = os.path.join(CAPTURES_DIR, name)
+            try:
+                if os.path.isdir(full_path) and os.path.getmtime(full_path) < report_cutoff:
+                    shutil.rmtree(full_path, ignore_errors=True)
+                    removed_files += 1
+            except Exception as e:
+                print(f"[Cleanup] failed to delete {full_path}: {e}", flush=True)
+
+    # 3. Clean stale temp uploads in temp_uploads/
+    if os.path.isdir("temp_uploads"):
+        for name in os.listdir("temp_uploads"):
+            full_path = os.path.join("temp_uploads", name)
+            try:
+                if os.path.isfile(full_path) and os.path.getmtime(full_path) < upload_cutoff:
+                    os.remove(full_path)
+                    removed_files += 1
+            except Exception as e:
+                print(f"[Cleanup] failed to delete {full_path}: {e}", flush=True)
+
+    if removed_files > 0:
+        print(f"[Cleanup] Removed {removed_files} expired artifact(s).", flush=True)
+
+
 def process_session_report(session_id: str, pothole_list: list, source: str, receiver_email: str | None):
     try:
         pdf_path, total_cost = build_pdf_report(session_id, pothole_list, source=source)
         pdf_url = upload_pdf_to_supabase(pdf_path, session_id)
-        
-        send_report_email(pdf_path, session_id, total_cost, len(pothole_list), receiver_email=receiver_email, pdf_url=pdf_url)
+        email_sent = send_report_email(
+            pdf_path,
+            session_id,
+            total_cost,
+            len(pothole_list),
+            receiver_email=receiver_email,
+            pdf_url=pdf_url,
+        )
         write_report_status(session_id, {
             "status": "ready",
             "pdf_url": pdf_url,
             "total_cost": total_cost,
             "pothole_count": len(pothole_list),
+            "email_sent": email_sent,
             "error": None,
         })
-        print(f"[Report] {session_id} ready. Potholes={len(pothole_list)} Cost=Rs.{total_cost} URL={pdf_url}", flush=True)
+        print(
+            f"[Report] {session_id} ready. Potholes={len(pothole_list)} "
+            f"Cost=Rs.{total_cost} EmailSent={email_sent} URL={pdf_url}",
+            flush=True,
+        )
     except Exception as e:
         print(f"[Report] generation failed for {session_id}: {e}", flush=True)
         traceback.print_exc()
         write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+    finally:
+        cleanup_session_captures(session_id)
+
+
+def schedule_session_report(
+    session_id: str,
+    pothole_list: list,
+    source: str,
+    verified_email: str | None,
+):
+    """Write explicit skipped status for 0-pothole sessions, otherwise queue PDF/email job."""
+    if not pothole_list:
+        write_report_status(session_id, {
+            "status": "skipped",
+            "reason": "No potholes detected in this session.",
+            "pdf_url": None,
+            "total_cost": 0,
+            "pothole_count": 0,
+            "email_sent": False,
+            "error": None,
+        })
+        cleanup_session_captures(session_id)
+        return
+
+    try:
+        write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
+        get_report_executor().submit(
+            process_session_report,
+            session_id,
+            pothole_list,
+            source,
+            verified_email,
+        )
+    except Exception as e:
+        write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+        cleanup_session_captures(session_id)
 
 # ---------------------------------------------------------------------------
 # SYNC INFERENCE HELPERS (RUN VIA asyncio.to_thread TO KEEP EVENT LOOP FREE)
@@ -923,16 +1080,7 @@ async def drone_stream_websocket(websocket: WebSocket, token: str | None = Query
         ]
         total = sum(p["cost"] for p in pothole_list)
         print(f"Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list and resolve_report_recipients(verified_email):
-            try:
-                write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
-                threading.Thread(
-                    target=process_session_report,
-                    args=(session_id, pothole_list, "Live IP Camera", verified_email),
-                    daemon=True,
-                ).start()
-            except Exception as e:
-                write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+        schedule_session_report(session_id, pothole_list, "Live IP Camera", verified_email)
 
 
 # ===========================================================================
@@ -996,18 +1144,7 @@ async def device_stream_websocket(websocket: WebSocket, token: str | None = Quer
         ]
         total = sum(p["cost"] for p in pothole_list)
         print(f"Device Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list and resolve_report_recipients(verified_email):
-            try:
-                write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
-                threading.Thread(
-                    target=process_session_report,
-                    args=(session_id, pothole_list, "Local Device Browser Camera", verified_email),
-                    daemon=True,
-                ).start()
-            except Exception as e:
-                write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
-        elif pothole_list:
-            print(f"[Warning] Session {session_id} ended with no recipient email configured. Skipping report generation.", flush=True)
+        schedule_session_report(session_id, pothole_list, "Local Device Browser Camera", verified_email)
 
 
 # ===========================================================================
@@ -1062,13 +1199,7 @@ async def analyze_video(
             os.remove(file_path)
 
     report_records = analysis["report_records"]
-    if report_records and resolve_report_recipients(verified_email):
-        write_report_status(batch_session_id, {"status": "processing", "pdf_url": None, "error": None})
-        threading.Thread(
-            target=process_session_report,
-            args=(batch_session_id, report_records, "Batch Video Upload", verified_email),
-            daemon=True,
-        ).start()
+    schedule_session_report(batch_session_id, report_records, "Batch Video Upload", verified_email)
 
     return {
         "status": "success",
