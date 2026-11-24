@@ -747,3 +747,25 @@ def get_report_status(session_id: str):
     if not status_data:
         raise HTTPException(status_code=404, detail="Report status not found")
     return status_data
+
+
+# ===========================================================================
+# 5. HEALTH & READINESS CHECKS
+# ===========================================================================
+@app.get("/health")
+@app.get("/api/v1/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+@app.get("/api/v1/ready")
+def readiness_check():
+    if model is None:
+        raise HTTPException(status_code=503, detail="YOLO model not loaded")
+    return {
+        "status": "ready",
+        "model_loaded": True,
+        "supabase_configured": bool(supabase_client),
+        "email_configured": bool(SENDER_EMAIL and SENDER_APP_PASSWORD),
+    }

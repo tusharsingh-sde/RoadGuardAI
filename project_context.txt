@@ -1,0 +1,433 @@
+================================================================================
+                        PROJECT CONTEXT — RoadGuard AI
+================================================================================
+
+Project Name     : RoadGuard AI
+Repository       : https://github.com/tusharsingh-sde/RoadGuardAI
+Author           : Tushar Singh (@tusharsingh-sde)
+Root Directory   : roadguard-email-auth/
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+RoadGuard AI is a full-stack, AI-powered pothole detection and road-maintenance
+cost estimation system. It uses a custom-trained YOLOv11 model to detect
+potholes in real time from live camera feeds (IP/USB/drone cameras, device
+browser cameras) or uploaded video files.
+
+For every pothole detected, the system estimates physical dimensions (width,
+breadth, depth) and calculates a maintenance repair cost in INR. At the end of
+each detection session a branded PDF report is generated, uploaded to Supabase
+Storage, and emailed to the administrator.
+
+Authentication is handled via Supabase Auth with domain-restricted access
+(configurable, defaults to @miet.ac.in), supporting Google OAuth and
+email/password sign-in.
+
+================================================================================
+2. ARCHITECTURE
+================================================================================
+
+┌─────────────────────────────────────────────────────────────────┐
+│                        Client Browser                          │
+│  Next.js 16 (Static Export) + Supabase Auth + Leaflet Map      │
+└────────────┬──────────────────────────┬─────────────────────────┘
+             │  WebSocket (frames)      │  REST (video upload)
+             ▼                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Nginx (Port 100)                           │
+│        Static files + reverse proxy to backend                 │
+└────────────┬──────────────────────────┬─────────────────────────┘
+             │  /ws/*                   │  /api/*
+             ▼                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                FastAPI Backend (Port 8000)                      │
+│   YOLOv11 inference · ByteTrack · PDF generation · Email       │
+└────────────┬──────────────────────────┬─────────────────────────┘
+             │                          │
+             ▼                          ▼
+     ┌──────────────┐         ┌──────────────────┐
+     │  IP / USB /  │         │    Supabase      │
+     │  Drone Cam   │         │  (Auth + Storage)│
+     └──────────────┘         └──────────────────┘
+
+Production adds a Caddy container (auto-HTTPS via Let's Encrypt) in front of
+Nginx. The three Docker containers are orchestrated via docker-compose.yml.
+
+================================================================================
+3. TECH STACK
+================================================================================
+
+BACKEND (Python 3.12)
+─────────────────────
+  • FastAPI            — REST API + WebSocket server
+  • Ultralytics YOLOv11 (v8.4.75)  — Custom pothole detection model
+  • OpenCV             — Video capture and image processing
+  • ByteTrack          — Multi-object tracking across frames
+  • ReportLab          — PDF report generation
+  • Supabase Python SDK — Cloud storage for PDF reports
+  • smtplib            — SMTP email with HTML templates
+  • Gunicorn + Uvicorn — Production ASGI server
+  • PyTorch (CPU-only) — Inference runtime for YOLO
+  • NumPy, Pillow      — Array/image manipulation
+
+FRONTEND (TypeScript)
+─────────────────────
+  • Next.js 16         — React framework (static export mode, output: "export")
+  • React 19           — UI library
+  • TypeScript 5       — Type-safe frontend code
+  • Tailwind CSS 4     — Utility-first styling (via @tailwindcss/postcss)
+  • Supabase JS SDK    — Authentication (Google OAuth + email/password)
+  • Leaflet + React-Leaflet — Satellite map with pothole markers
+  • Geist + Geist Mono — Google Fonts for typography
+  • Nginx              — Static file serving + API/WS reverse proxy (Docker)
+
+INFRASTRUCTURE
+──────────────
+  • Docker Compose     — Multi-container orchestration (3 services)
+  • Caddy              — Automatic HTTPS with Let's Encrypt
+  • nip.io             — Wildcard DNS for VM public IPs (dev/staging)
+
+EXTERNAL SERVICES
+─────────────────
+  • Supabase           — Auth (Google OAuth, email/password) + Storage (PDF)
+  • Gmail SMTP         — Outbound report emails (via App Passwords)
+  • Nominatim (OSM)    — Reverse geocoding for map address bar
+  • ESRI ArcGIS        — Satellite map tile provider
+
+================================================================================
+4. PROJECT STRUCTURE (File-by-File)
+================================================================================
+
+roadguard-email-auth/
+├── .gitignore                      # Git ignore rules (envs, venv, node_modules, .next, session data)
+├── README.md                       # Full project documentation (545 lines)
+├── docker-compose.yml              # 3-service orchestration: backend, frontend, caddy
+├── Caddyfile                       # Caddy reverse proxy → frontend:100, auto-HTTPS
+│
+├── backend/
+│   ├── main.py                     # ** MONOLITHIC BACKEND ** (749 lines)
+│   │                                 All FastAPI endpoints, YOLO inference, ByteTrack tracking,
+│   │                                 pothole dimension estimation, cost calculation, PDF generation,
+│   │                                 Supabase upload, HTML email sending, report status tracking.
+│   ├── pothole_best.pt             # Custom-trained YOLOv11 model weights (~5.2 MB)
+│   ├── requirements.txt            # Python dependencies (43 lines, CPU-only PyTorch)
+│   ├── Dockerfile                  # Python 3.12-slim, system deps (libgl1, libglib2.0), pip install
+│   ├── .env.example                # Template: SUPABASE_URL/KEY, SMTP credentials, ADMIN_EMAIL
+│   ├── .env                        # Actual secrets (gitignored)
+│   ├── .dockerignore               # Docker build exclusions
+│   ├── session_captures/           # Per-session cropped pothole images (auto-created, gitignored)
+│   ├── session_reports/            # Generated PDF reports + status JSONs (auto-created, gitignored)
+│   ├── temp_uploads/               # Temporary uploaded video files (auto-created, gitignored)
+│   └── venv/                       # Python virtual environment (gitignored)
+│
+├── frontend/
+│   ├── app/
+│   │   ├── page.tsx                # ** MAIN DASHBOARD ** (1110 lines)
+│   │   │                             Live detection view (IP cam + device camera), session history,
+│   │   │                             video upload, PDF/reports viewer. WebSocket connections,
+│   │   │                             real-time stats, severity counters, cost tracking.
+│   │   │                             Sidebar navigation: Live Detection | History | Video Uploads | PDFs/Reports
+│   │   ├── login/page.tsx          # ** AUTH PAGE ** (254 lines)
+│   │   │                             Email/password sign-in + sign-up with domain validation,
+│   │   │                             Google OAuth, confirmation email flow, error handling.
+│   │   ├── PotholeMap.tsx          # ** SATELLITE MAP ** (138 lines)
+│   │   │                             Leaflet map with ESRI satellite tiles, user geolocation,
+│   │   │                             color-coded severity markers, reverse geocoding address bar.
+│   │   ├── layout.tsx              # Root layout: Geist fonts, AuthProvider wrapper, metadata
+│   │   ├── globals.css             # Global styles (~20KB, all UI styling)
+│   │   └── favicon.ico             # App favicon
+│   │
+│   ├── lib/supabase/
+│   │   ├── client.ts               # Supabase client singleton, ALLOWED_EMAIL_DOMAIN export,
+│   │   │                             isAuthorizedEmail() helper
+│   │   └── AuthProvider.tsx        # React context: auth state machine (loading → signed-out |
+│   │                                 unauthorized-domain | authorized), Google OAuth flow,
+│   │                                 email sign-in/sign-up, domain enforcement, session evaluation
+│   │
+│   ├── supabase/sql/
+│   │   └── restrict_email_domain.sql  # PostgreSQL trigger on auth.users: enforces @miet.ac.in
+│   │                                    domain at DB level (security layer, not just UX)
+│   │
+│   ├── nginx.conf                  # Nginx config: listen :100, serve static, proxy /api/ and /ws/
+│   │                                 to backend:8000, WebSocket upgrade, 600s timeouts
+│   ├── dockerfile                  # Multi-stage: Node 20 build → Nginx Alpine serve
+│   ├── .env.example                # Template: NEXT_PUBLIC_SUPABASE_URL/ANON_KEY, ALLOWED_DOMAIN
+│   ├── .env.local                  # Actual frontend env vars (gitignored)
+│   ├── package.json                # Dependencies: next, react, supabase-js, leaflet, tailwindcss
+│   ├── package-lock.json           # Lockfile
+│   ├── next.config.ts              # Static export config (output: "export", unoptimized images)
+│   ├── next-env.d.ts               # Next.js TypeScript declarations
+│   ├── tsconfig.json               # TypeScript config
+│   ├── postcss.config.mjs          # PostCSS + Tailwind config
+│   ├── eslint.config.mjs           # ESLint config
+│   ├── node_modules/               # (gitignored)
+│   └── .next/                      # Next.js build cache (gitignored)
+
+================================================================================
+5. API SURFACE
+================================================================================
+
+WEBSOCKET ENDPOINTS (real-time streaming)
+─────────────────────────────────────────
+
+  ws://.../ws/drone-stream?email=user@example.com
+    Model: PULL — backend connects to IP/USB camera, runs YOLO inference,
+    streams annotated frames + detection data back over WebSocket.
+    Client sends initial JSON: { "camera_url": "http://..." }
+    Backend reads frames from OpenCV VideoCapture in a loop.
+
+  ws://.../ws/device-stream?email=user@example.com
+    Model: PUSH — client captures frames from device browser camera, sends
+    base64-encoded frames as JSON: { "frame": "data:image/jpeg;base64,..." }
+    Backend decodes, runs YOLO, returns annotated frame + detections.
+
+  WebSocket Response Payload (both endpoints):
+  {
+    "session_id": "a1b2c3d4e5f6",
+    "image": "data:image/jpeg;base64,...",
+    "count": 3,
+    "critical": 1,
+    "high": 1,
+    "medium": 1,
+    "session_total_maintenance_cost": 1250,
+    "session_unique_potholes": 5,
+    "detections": [
+      {
+        "id": 1,
+        "confidence": 0.91,
+        "width_cm": 28.4,
+        "breadth_cm": 19.2,
+        "depth_cm": 8.7,
+        "volume_m3": 0.00475,
+        "estimated_cost": 190
+      }
+    ]
+  }
+
+REST ENDPOINTS
+──────────────
+
+  POST /api/v1/analyze-video?email=user@example.com
+    Upload a video file (multipart form) for batch pothole analysis.
+    Processes every Nth frame (N = FPS, i.e. 1 frame/second).
+    Returns JSON with detection summary, per-pothole dimensions, costs.
+    Triggers async PDF report generation + email in background thread.
+
+  GET /api/v1/reports/{session_id}/status
+    Poll the status of a session's PDF report.
+    Returns: { "status": "processing" | "ready" | "error", "pdf_url": "...", ... }
+
+================================================================================
+6. CORE ALGORITHMS & BUSINESS LOGIC
+================================================================================
+
+POTHOLE DETECTION
+─────────────────
+  • Model: YOLOv11 custom-trained (pothole_best.pt), confidence threshold 60%.
+  • Tracker: ByteTrack (bytetrack.yaml) for persistent IDs across frames.
+  • Each unique track_id = one physical pothole (avoids double-counting).
+
+DIMENSION ESTIMATION
+────────────────────
+  • CM_PER_PIXEL = 0.4 (configurable ratio)
+  • Width  = (x2 - x1) × CM_PER_PIXEL
+  • Breadth = (y2 - y1) × CM_PER_PIXEL
+  • Depth  = 3.0 + (confidence²) × 15.0 + (area_px / 6000.0)
+             clamped to [3.0, 25.0] cm
+
+MAINTENANCE COST CALCULATION
+─────────────────────────────
+  Volume (m³)   = (width_cm / 100) × (breadth_cm / 100) × (depth_cm / 100)
+  Material Cost = Volume × ₹8,500/m³
+  Total Cost    = ₹150 (fixed labour) + Material Cost
+
+SEVERITY CLASSIFICATION
+───────────────────────
+  • CRITICAL : confidence ≥ 85%
+  • HIGH     : confidence ≥ 75%
+  • MEDIUM   : confidence < 75%
+
+================================================================================
+7. AUTHENTICATION FLOW
+================================================================================
+
+Two-layer domain restriction for @miet.ac.in:
+
+Layer 1 — Client-Side (UX only, not a security boundary):
+  • AuthProvider.tsx evaluates every session via isAuthorizedEmail().
+  • If domain doesn't match → immediate signOut + "unauthorized-domain" status.
+  • Login page pre-validates email domain during sign-up.
+
+Layer 2 — Database-Level (trusted security boundary):
+  • PostgreSQL trigger on auth.users (restrict_email_domain.sql).
+  • Fires BEFORE INSERT, raises exception for non-@miet.ac.in emails.
+  • Blocks account creation for both Google OAuth and email/password.
+
+Auth States: loading → signed-out | unauthorized-domain | authorized
+
+Supported Methods:
+  • Google OAuth (via Supabase signInWithOAuth)
+  • Email/Password (sign-up with email confirmation + sign-in)
+
+================================================================================
+8. REPORT PIPELINE
+================================================================================
+
+  1. Session ends (WebSocket disconnect or video processing complete)
+  2. Background thread spawned via threading.Thread (daemon=True)
+  3. build_pdf_report() — generates branded A4 PDF with ReportLab:
+     - Header with branding + timestamp
+     - Summary stats (total potholes, total cost, source)
+     - Per-pothole cards: cropped image, severity badge, dimensions, cost
+  4. upload_pdf_to_supabase() — uploads PDF to "pothole-reports" bucket, gets public URL
+  5. send_report_email() — sends rich HTML email with:
+     - Styled summary (pothole count, maintenance cost)
+     - CTA button linking to cloud PDF
+     - PDF attached to email
+  6. Report status tracked via in-memory dict + JSON file on disk
+     Status values: "processing" → "ready" | "error"
+
+================================================================================
+9. FRONTEND VIEWS / PAGES
+================================================================================
+
+  / (Dashboard — page.tsx)
+  ├── Live Detection     — Start/stop IP cam or device camera stream
+  │                        Real-time annotated video, stats counters,
+  │                        satellite map with severity markers
+  ├── History            — Session history from Supabase "session_history" table
+  ├── Video Uploads      — File upload form for batch analysis (100MB+ support)
+  └── PDFs / Reports     — List of generated reports with download links
+
+  /login (Auth — login/page.tsx)
+  ├── Sign In            — Email/password form
+  ├── Register           — Sign-up with password confirmation
+  └── Google OAuth       — "Continue with Google" button
+
+================================================================================
+10. ENVIRONMENT VARIABLES
+================================================================================
+
+BACKEND (backend/.env)
+──────────────────────
+  SUPABASE_URL              — Supabase project URL
+  SUPABASE_KEY              — Supabase service_role key (for Storage uploads)
+  SUPABASE_BUCKET           — Storage bucket name (default: "pothole-reports")
+  SENDER_EMAIL              — Gmail address for outbound reports
+  SENDER_APP_PASSWORD       — Gmail App Password (16-char)
+  ADMIN_EMAIL               — Recipient email for reports
+  SMTP_HOST                 — SMTP server (default: smtp.gmail.com)
+  SMTP_PORT                 — SMTP port (default: 587)
+
+FRONTEND (frontend/.env.local)
+──────────────────────────────
+  NEXT_PUBLIC_SUPABASE_URL       — Supabase project URL
+  NEXT_PUBLIC_SUPABASE_ANON_KEY  — Supabase anon/public key (safe for browser)
+  NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN — Allowed email domain (default: miet.ac.in)
+
+================================================================================
+11. DOCKER / DEPLOYMENT
+================================================================================
+
+Three containers via docker-compose.yml:
+
+  ┌────────────────┬───────────────────────────────────────────────────────────┐
+  │ Service        │ Details                                                  │
+  ├────────────────┼───────────────────────────────────────────────────────────┤
+  │ backend        │ Python 3.12-slim, Gunicorn+Uvicorn, port 8000 (internal)│
+  │ (back-nitin)   │ Build: ./backend/Dockerfile                             │
+  │                │ Env: backend/.env                                       │
+  ├────────────────┼───────────────────────────────────────────────────────────┤
+  │ frontend       │ Multi-stage: Node 20 build → Nginx Alpine               │
+  │ (front-nitin)  │ Serves static export on port 100                        │
+  │                │ Nginx proxies /api/ and /ws/ to backend:8000            │
+  │                │ Build: ./frontend/dockerfile                            │
+  ├────────────────┼───────────────────────────────────────────────────────────┤
+  │ caddy          │ caddy:alpine image, ports 80 + 443                      │
+  │ (caddy-nitin)  │ Auto-HTTPS via Let's Encrypt                            │
+  │                │ Reverse proxy → frontend:100                            │
+  │                │ Config: ./Caddyfile (update IP for your VM)             │
+  └────────────────┴───────────────────────────────────────────────────────────┘
+
+Local Development (without Docker):
+  • Backend:  cd backend → python -m venv venv → pip install -r requirements.txt
+              → uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  • Frontend: cd frontend → npm install → npm run dev
+  • Frontend auto-detects localhost and connects to ws://127.0.0.1:8000
+
+Production Build:
+  docker compose up -d --build
+  Access at: https://YOUR_VM_PUBLIC_IP.nip.io
+
+================================================================================
+12. KEY CONFIGURATION CONSTANTS (backend/main.py)
+================================================================================
+
+  DRONE_IP_CAM_URL        = "http://192.168.1.2:8080/video"  (default IP cam)
+  CM_PER_PIXEL            = 0.4    (pixel-to-cm conversion ratio)
+  MIN_DEPTH_CM            = 3.0    (minimum estimated depth)
+  MAX_DEPTH_CM            = 25.0   (maximum estimated depth)
+  COST_PER_CUBIC_METER_INR = 8500  (material cost per m³)
+  FIXED_LABOR_COST_INR    = 150    (flat labour charge per pothole)
+  YOLO confidence threshold = 0.60 (in model.track() calls)
+  JPEG quality (stream)   = 75     (WebSocket frame encoding)
+  JPEG quality (crops)    = 88     (saved pothole crop images)
+
+================================================================================
+13. SUPABASE RESOURCES REQUIRED
+================================================================================
+
+  1. Storage Bucket: "pothole-reports" (Public access, for PDF downloads)
+  2. Auth Providers: Google OAuth + Email/Password enabled
+  3. DB Table (optional): session_history (id, location_address, total_potholes,
+                           estimated_cost, session_date)
+  4. DB Trigger: enforce_miet_email_domain_trigger on auth.users
+                 (restricts sign-ups to @miet.ac.in)
+
+================================================================================
+14. KEY DEPENDENCIES (versions)
+================================================================================
+
+  Backend:
+    torch==2.12.1+cpu, torchvision==0.27.1+cpu
+    fastapi==0.115.5, uvicorn==0.32.1, gunicorn==23.0.0
+    ultralytics==8.4.75 (YOLOv11)
+    numpy==2.4.6, Pillow==10.4.0, opencv (via ultralytics)
+    reportlab==5.0.1, supabase==2.31.0
+    python-dotenv==1.0.1, httpx==0.28.1, requests==2.34.2
+
+  Frontend:
+    next==16.3.3, react==19.2.8, react-dom==19.2.8
+    @supabase/supabase-js==^2.45.4
+    leaflet==^1.9.4, react-leaflet==^5.0.0
+    tailwindcss==^4, typescript==^5
+
+================================================================================
+15. DATA FLOW SUMMARY
+================================================================================
+
+  ┌──────────┐   frames    ┌──────────┐   YOLO    ┌───────────┐
+  │ Camera / ├────────────►│ FastAPI  ├──────────►│ YOLOv11   │
+  │ Browser  │             │ WebSocket│           │ + ByteTrack│
+  └──────────┘             └────┬─────┘           └─────┬─────┘
+                                │                       │
+                                │ annotated frame +     │ detections
+                                │ detection JSON        │
+                                ▼                       │
+                           ┌─────────┐                  │
+                           │ Browser │◄─────────────────┘
+                           │ (React) │
+                           └─────────┘
+                                                   On session end:
+                                                   ┌────────────────┐
+                                                   │ Background     │
+                                                   │ Thread         │
+                                                   │  → PDF (ReportLab)
+                                                   │  → Upload (Supabase)
+                                                   │  → Email (SMTP)
+                                                   └────────────────┘
+
+================================================================================
+END OF PROJECT CONTEXT
+================================================================================
