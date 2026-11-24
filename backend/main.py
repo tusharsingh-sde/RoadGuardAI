@@ -1,4 +1,6 @@
 import traceback
+import math
+import binascii
 import re
 import socket
 import ipaddress
@@ -46,26 +48,47 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+MODEL_PATH = "pothole_best.pt"
 print("Loading YOLOv11 Model...", flush=True)
-model = YOLO("pothole_best.pt")
+model = YOLO(MODEL_PATH)
 
 os.makedirs("temp_uploads", exist_ok=True)
 
 DRONE_IP_CAM_URL = "http://192.168.1.2:8080/video"
 
 # ---------------------------------------------------------------------------
-# MAINTENANCE COST ESTIMATION CONFIG
+# MAINTENANCE COST ESTIMATION & INFERENCE CONFIG
 # ---------------------------------------------------------------------------
+CANONICAL_FRAME_WIDTH = 640.0
 CM_PER_PIXEL = 0.4
 MIN_DEPTH_CM = 3.0
 MAX_DEPTH_CM = 25.0
 COST_PER_CUBIC_METER_INR = 8500
 FIXED_LABOR_COST_INR = 150
 
+MAX_CONCURRENT_INFERENCE = max(1, int(os.getenv("MAX_CONCURRENT_INFERENCE", "2")))
+INFERENCE_SEMAPHORE = threading.Semaphore(MAX_CONCURRENT_INFERENCE)
+MAX_CAM_READ_FAILURES = 60  # ~3s at 0.05s sleep before closing dead IP cam
 
-def estimate_pothole_dimensions(x1: float, y1: float, x2: float, y2: float, conf: float):
-    width_px = max(1.0, x2 - x1)
-    breadth_px = max(1.0, y2 - y1)
+
+def create_session_model() -> YOLO:
+    """Create an isolated YOLO instance per session so ByteTrack state never bleeds."""
+    return YOLO(MODEL_PATH)
+
+
+def estimate_pothole_dimensions(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    conf: float,
+    frame_width: int = 640,
+):
+    # Normalize pixel dimensions to canonical 640px width so 4K & 640p produce consistent estimates
+    scale = CANONICAL_FRAME_WIDTH / max(1.0, float(frame_width))
+    width_px = max(1.0, (x2 - x1) * scale)
+    breadth_px = max(1.0, (y2 - y1) * scale)
+
     width_cm = round(width_px * CM_PER_PIXEL, 1)
     breadth_cm = round(breadth_px * CM_PER_PIXEL, 1)
     area_px = width_px * breadth_px
@@ -79,6 +102,23 @@ def calculate_maintenance_cost(width_cm: float, breadth_cm: float, depth_cm: flo
     material_cost = volume_m3 * COST_PER_CUBIC_METER_INR
     total_cost = round(FIXED_LABOR_COST_INR + material_cost)
     return total_cost, round(volume_m3, 5)
+
+
+def compute_sighting_score(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    conf: float,
+    frame_w: int,
+    frame_h: int,
+) -> float:
+    """Prefer high-confidence, well-framed (non-border-clipped), larger sightings."""
+    margin = 5.0
+    is_clipped = x1 <= margin or y1 <= margin or x2 >= (frame_w - margin) or y2 >= (frame_h - margin)
+    norm_area = ((max(1.0, x2 - x1) * max(1.0, y2 - y1)) / max(1.0, float(frame_w * frame_h)))
+    base_score = conf * (1.0 + min(norm_area * 2.0, 0.5))
+    return base_score * (0.6 if is_clipped else 1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +627,224 @@ def process_session_report(session_id: str, pothole_list: list, source: str, rec
         traceback.print_exc()
         write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
 
+# ---------------------------------------------------------------------------
+# SYNC INFERENCE HELPERS (RUN VIA asyncio.to_thread TO KEEP EVENT LOOP FREE)
+# ---------------------------------------------------------------------------
+def open_video_capture(source):
+    cap = cv2.VideoCapture(source)
+    if cap.isOpened():
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    return cap
+
+
+def process_tracked_frame(
+    session_model: YOLO,
+    session_id: str,
+    frame,
+    session_pothole_data: dict,
+    track_id_map: dict,
+    id_prefix: str = "",
+    frame_index: int | None = None,
+    encode_frame: bool = True,
+):
+    frame_h, frame_w = frame.shape[:2]
+
+    with INFERENCE_SEMAPHORE:
+        results = session_model.track(
+            frame,
+            tracker="bytetrack.yaml",
+            persist=True,
+            conf=0.60,
+            verbose=False,
+        )
+
+    annotated_frame = results[0].plot() if encode_frame else None
+
+    detections = []
+    critical, high, medium = 0, 0, 0
+    boxes = results[0].boxes
+
+    if boxes is not None:
+        for box in boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            conf = float(box.conf[0])
+            raw_track_id = int(box.id[0]) if box.id is not None else None
+
+            if conf >= 0.85:
+                critical += 1
+            elif conf >= 0.75:
+                high += 1
+            else:
+                medium += 1
+
+            width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(
+                x1, y1, x2, y2, conf, frame_width=frame_w
+            )
+            pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
+
+            display_id = None
+            if raw_track_id is not None:
+                if raw_track_id not in track_id_map:
+                    next_num = len(track_id_map) + 1
+                    track_id_map[raw_track_id] = f"{id_prefix}{next_num}" if id_prefix else next_num
+                display_id = track_id_map[raw_track_id]
+
+                sighting_score = compute_sighting_score(x1, y1, x2, y2, conf, frame_w, frame_h)
+                existing = session_pothole_data.get(display_id)
+                is_first_sighting = existing is None
+                # Hysteresis (+0.03) avoids unnecessary disk rewrites on tiny score jitter
+                is_better_sighting = (
+                    existing is not None and sighting_score > existing["best_score"] + 0.03
+                )
+
+                if is_first_sighting or is_better_sighting:
+                    crop_path = save_pothole_context_crop(
+                        session_id, display_id, frame, x1, y1, x2, y2
+                    )
+                    if crop_path is None and existing is not None:
+                        crop_path = existing.get("image_path")
+
+                    record = {
+                        "id": display_id,
+                        "confidence": conf,
+                        "width_cm": width_cm,
+                        "breadth_cm": breadth_cm,
+                        "depth_cm": depth_cm,
+                        "volume_m3": volume_m3,
+                        "estimated_cost": pothole_cost,
+                        "cost": pothole_cost,
+                        "image_path": crop_path,
+                        "best_score": sighting_score,
+                    }
+                    if frame_index is not None:
+                        record["frame"] = frame_index
+                    session_pothole_data[display_id] = record
+
+            detections.append({
+                "id": display_id,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "confidence": conf,
+                "width_cm": width_cm,
+                "breadth_cm": breadth_cm,
+                "depth_cm": depth_cm,
+                "volume_m3": volume_m3,
+                "estimated_cost": pothole_cost,
+            })
+
+    if not encode_frame:
+        return detections
+
+    _, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    out_base64 = base64.b64encode(buffer).decode("utf-8")
+    session_total_cost = sum(p["cost"] for p in session_pothole_data.values())
+
+    return {
+        "session_id": session_id,
+        "image": f"data:image/jpeg;base64,{out_base64}",
+        "count": len(detections),
+        "critical": critical,
+        "high": high,
+        "medium": medium,
+        "session_total_maintenance_cost": session_total_cost,
+        "session_unique_potholes": len(session_pothole_data),
+        "detections": detections,
+    }
+
+
+def decode_and_process_device_frame(
+    session_model: YOLO,
+    session_id: str,
+    base64_str: str,
+    session_pothole_data: dict,
+    track_id_map: dict,
+):
+    _, encoded = base64_str.split(",", 1) if "," in base64_str else ("", base64_str)
+    img_bytes = base64.b64decode(encoded, validate=True)
+    np_arr = np.frombuffer(img_bytes, np.uint8)
+    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+    if frame is None:
+        return None
+    return process_tracked_frame(
+        session_model=session_model,
+        session_id=session_id,
+        frame=frame,
+        session_pothole_data=session_pothole_data,
+        track_id_map=track_id_map,
+        encode_frame=True,
+    )
+
+
+def analyze_video_file(file_path: str, batch_session_id: str):
+    cap = cv2.VideoCapture(file_path)
+    if not cap.isOpened():
+        raise ValueError("Could not decode uploaded video file.")
+
+    session_model = create_session_model()
+    session_pothole_data = {}
+    track_id_map = {}
+
+    try:
+        raw_fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = raw_fps if (raw_fps and not math.isnan(raw_fps) and raw_fps > 0) else 30.0
+        # ~3 FPS sampling keeps ByteTrack smooth across frames while preventing double-counting
+        frame_skip = max(1, int(round(fps / 3.0)))
+
+        frame_count = 0
+        frames_analyzed = 0
+
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
+
+            if frame_count % frame_skip == 0:
+                frames_analyzed += 1
+                process_tracked_frame(
+                    session_model=session_model,
+                    session_id=batch_session_id,
+                    frame=frame,
+                    session_pothole_data=session_pothole_data,
+                    track_id_map=track_id_map,
+                    id_prefix="B",
+                    frame_index=frame_count,
+                    encode_frame=False,
+                )
+
+            frame_count += 1
+    finally:
+        cap.release()
+        session_model.predictor = None
+
+    pothole_records = list(session_pothole_data.values())
+    critical = sum(1 for p in pothole_records if p["confidence"] >= 0.85)
+    high = sum(1 for p in pothole_records if 0.75 <= p["confidence"] < 0.85)
+    medium = sum(1 for p in pothole_records if p["confidence"] < 0.75)
+    total_maintenance_cost = sum(p["cost"] for p in pothole_records)
+
+    # Internal list for PDF report (keeps image_path, strips best_score)
+    report_records = [
+        {k: v for k, v in p.items() if k != "best_score"}
+        for p in pothole_records
+    ]
+    # Public API list (strips internal server image_path & best_score)
+    public_records = [
+        {k: v for k, v in p.items() if k not in {"best_score", "image_path"}}
+        for p in pothole_records
+    ]
+
+    return {
+        "frames_analyzed": frames_analyzed,
+        "total_potholes": len(pothole_records),
+        "severity_breakdown": {"critical": critical, "high": high, "medium": medium},
+        "total_maintenance_cost": total_maintenance_cost,
+        "report_records": report_records,
+        "public_records": public_records,
+    }
+
+
 # ===========================================================================
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
 # ===========================================================================
@@ -615,98 +873,67 @@ async def drone_stream_websocket(websocket: WebSocket, token: str | None = Query
         return
 
     print(f"Connecting to Drone Camera Stream at: {camera_url} | session_id={session_id}", flush=True)
-    cap = cv2.VideoCapture(camera_url)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  
-    
+    cap = await asyncio.to_thread(open_video_capture, camera_url)
+
     if not cap.isOpened():
+        await asyncio.to_thread(cap.release)
         await websocket.send_json({"error": "Failed to connect to IP Camera stream."})
         await websocket.close()
         return
 
+    session_model = await asyncio.to_thread(create_session_model)
     session_pothole_data = {}
+    track_id_map = {}
+    consecutive_failures = 0
 
     try:
         while True:
-            success, frame = cap.read()
-            if not success:
+            success, frame = await asyncio.to_thread(cap.read)
+            if not success or frame is None:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CAM_READ_FAILURES:
+                    print(f"[DroneStream] Camera read timeout for session {session_id}.", flush=True)
+                    await websocket.send_json({"error": "Camera stream disconnected or timed out."})
+                    break
                 await asyncio.sleep(0.05)
                 continue
 
-            results = model.track(frame, tracker="bytetrack.yaml", persist=True, conf=0.60, verbose=False)
-            annotated_frame = results[0].plot()
-
-            detections = []
-            critical, high, medium = 0, 0, 0
-            boxes = results[0].boxes
-            if boxes is not None:
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    conf = float(box.conf[0])
-                    
-                    track_id = int(box.id[0]) if box.id is not None else None
-                    
-                    if conf >= 0.85: critical += 1
-                    elif conf >= 0.75: high += 1
-                    else: medium += 1
-
-                    width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
-                    pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
-
-                    if track_id is not None:
-                        is_first_sighting = track_id not in session_pothole_data
-                        image_path = None
-                        if is_first_sighting:
-                            image_path = save_pothole_context_crop(session_id, track_id, frame, x1, y1, x2, y2)
-                        else:
-                            image_path = session_pothole_data[track_id].get("image_path")
-
-                        session_pothole_data[track_id] = {
-                            "id": track_id, "confidence": conf, "width_cm": width_cm,
-                            "breadth_cm": breadth_cm, "depth_cm": depth_cm,
-                            "cost": pothole_cost, "image_path": image_path,
-                        }
-
-                    detections.append({
-                        "id": track_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "confidence": conf, "width_cm": width_cm, "breadth_cm": breadth_cm,
-                        "depth_cm": depth_cm, "volume_m3": volume_m3, "estimated_cost": pothole_cost
-                    })
-
-            _, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            base64_frame = base64.b64encode(buffer).decode("utf-8")
-
-            session_total_cost = sum(p["cost"] for p in session_pothole_data.values())
-
-            payload = {
-                "session_id": session_id,
-                "image": f"data:image/jpeg;base64,{base64_frame}",
-                "count": len(detections), "critical": critical, "high": high, "medium": medium,
-                "estimated_cost": len(detections) * 250, 
-                "session_total_maintenance_cost": session_total_cost,
-                "session_unique_potholes": len(session_pothole_data),
-                "detections": detections
-            }
-
+            consecutive_failures = 0
+            payload = await asyncio.to_thread(
+                process_tracked_frame,
+                session_model,
+                session_id,
+                frame,
+                session_pothole_data,
+                track_id_map,
+            )
             await websocket.send_json(payload)
-            await asyncio.sleep(0.005) 
+            await asyncio.sleep(0.005)
 
     except WebSocketDisconnect:
         print("Frontend disconnected from Drone Stream.", flush=True)
     except Exception as e:
         print(f"Stream error: {e}", flush=True)
     finally:
-        cap.release()
-        pothole_list = list(session_pothole_data.values())
+        await asyncio.to_thread(cap.release)
+        session_model.predictor = None
+        pothole_list = [
+            {k: v for k, v in p.items() if k != "best_score"}
+            for p in session_pothole_data.values()
+        ]
         total = sum(p["cost"] for p in pothole_list)
         print(f"Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
         if pothole_list and resolve_report_recipients(verified_email):
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Live IP Camera", verified_email), daemon=True
+                    target=process_session_report,
+                    args=(session_id, pothole_list, "Live IP Camera", verified_email),
+                    daemon=True,
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+
 
 # ===========================================================================
 # 2. PUSH MODEL (NEW USP): WEBSOCKET FOR DEVICE BROWSER CAMERA
@@ -722,90 +949,66 @@ async def device_stream_websocket(websocket: WebSocket, token: str | None = Quer
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
     print(f"Connecting to Device Browser Camera Stream | session_id={session_id}", flush=True)
+
+    session_model = await asyncio.to_thread(create_session_model)
     session_pothole_data = {}
+    track_id_map = {}
+
     try:
         while True:
-            data = await websocket.receive_json()
-            base64_str = data.get("frame")
-            if not base64_str:
+            raw_text = await websocket.receive_text()
+            try:
+                data = json.loads(raw_text)
+            except json.JSONDecodeError:
+                print(f"[DeviceStream] Skipping malformed JSON frame in session {session_id}", flush=True)
                 continue
-            header, encoded = base64_str.split(",", 1) if "," in base64_str else ("", base64_str)
-            img_bytes = base64.b64decode(encoded)
-            np_arr = np.frombuffer(img_bytes, np.uint8)
-            frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-            if frame is None:
+            base64_str = data.get("frame") if isinstance(data, dict) else None
+            if not isinstance(base64_str, str) or not base64_str:
                 continue
-            
-            results = model.track(frame, tracker="bytetrack.yaml", persist=True, conf=0.60, verbose=False)
-            annotated_frame = results[0].plot()
-            detections = []
-            critical, high, medium = 0, 0, 0
-            boxes = results[0].boxes
 
-            if boxes is not None:
-                for box in boxes:
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    conf = float(box.conf[0])
-                    track_id = int(box.id[0]) if box.id is not None else None
+            try:
+                payload = await asyncio.to_thread(
+                    decode_and_process_device_frame,
+                    session_model,
+                    session_id,
+                    base64_str,
+                    session_pothole_data,
+                    track_id_map,
+                )
+            except (binascii.Error, ValueError) as exc:
+                print(f"[DeviceStream] Skipping corrupt frame in session {session_id}: {exc}", flush=True)
+                continue
 
-                    if conf >= 0.85: critical += 1
-                    elif conf >= 0.75: high += 1
-                    else: medium += 1
-                    width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
-                    pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
+            if payload is None:
+                continue
 
-                    if track_id is not None:
-                        is_first_sighting = track_id not in session_pothole_data
-                        image_path = None
-                        if is_first_sighting:
-                            image_path = save_pothole_context_crop(session_id, track_id, frame, x1, y1, x2, y2)
-                        else:
-                            image_path = session_pothole_data[track_id].get("image_path")
-
-                        session_pothole_data[track_id] = {
-                            "id": track_id, "confidence": conf, "width_cm": width_cm,
-                            "breadth_cm": breadth_cm, "depth_cm": depth_cm,
-                            "cost": pothole_cost, "image_path": image_path,
-                        }
-                    detections.append({
-                        "id": track_id, "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                        "confidence": conf, "width_cm": width_cm, "breadth_cm": breadth_cm,
-                        "depth_cm": depth_cm, "volume_m3": volume_m3, "estimated_cost": pothole_cost
-                    })
-                    
-            _, buffer = cv2.imencode(".jpg", annotated_frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            out_base64 = base64.b64encode(buffer).decode("utf-8")
-            session_total_cost = sum(p["cost"] for p in session_pothole_data.values())
-            
-            payload = {
-                "session_id": session_id,
-                "image": f"data:image/jpeg;base64,{out_base64}",
-                "count": len(detections), "critical": critical, "high": high, "medium": medium,
-                "estimated_cost": len(detections) * 250,
-                "session_total_maintenance_cost": session_total_cost,
-                "session_unique_potholes": len(session_pothole_data),
-                "detections": detections
-            }
             await websocket.send_json(payload)
     except WebSocketDisconnect:
         print("Frontend disconnected from Device Stream.", flush=True)
     except Exception as e:
         print(f"Device Stream error: {e}", flush=True)
     finally:
-        pothole_list = list(session_pothole_data.values())
+        session_model.predictor = None
+        pothole_list = [
+            {k: v for k, v in p.items() if k != "best_score"}
+            for p in session_pothole_data.values()
+        ]
         total = sum(p["cost"] for p in pothole_list)
         print(f"Device Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
         if pothole_list and resolve_report_recipients(verified_email):
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Local Device Browser Camera", verified_email), daemon=True
+                    target=process_session_report,
+                    args=(session_id, pothole_list, "Local Device Browser Camera", verified_email),
+                    daemon=True,
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
         elif pothole_list:
             print(f"[Warning] Session {session_id} ended with no recipient email configured. Skipping report generation.", flush=True)
+
 
 # ===========================================================================
 # 3. BATCH UPLOAD FOR LARGE 100MB+ RECORDED VIDEOS
@@ -829,10 +1032,10 @@ async def analyze_video(
 
     unique_filename = f"{uuid.uuid4().hex}{file_ext}"
     file_path = os.path.join("temp_uploads", unique_filename)
+    batch_session_id = uuid.uuid4().hex[:12]
 
     total_bytes = 0
     chunk_size = 1024 * 1024  # 1 MB chunks
-    cap = None
     try:
         with open(file_path, "wb") as buffer:
             while True:
@@ -850,76 +1053,31 @@ async def analyze_video(
         if total_bytes == 0:
             raise HTTPException(status_code=400, detail="Uploaded video file is empty.")
 
-        cap = cv2.VideoCapture(file_path)
-        if not cap.isOpened():
-            raise HTTPException(status_code=400, detail="Could not decode uploaded video file.")
-
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        frame_skip = max(1, int(fps))
-
-        total_potholes = 0
-        critical, high, medium = 0, 0, 0
-        frame_count = 0
-        total_maintenance_cost = 0
-        pothole_dimensions = []
-        batch_session_id = uuid.uuid4().hex[:12]
-
-        while cap.isOpened():
-            success, frame = cap.read()
-            if not success:
-                break
-
-            if frame_count % frame_skip == 0:
-                results = model(frame, conf=0.60, verbose=False)
-                if results[0].boxes:
-                    for box in results[0].boxes:
-                        total_potholes += 1
-                        conf = float(box.conf[0])
-
-                        if conf >= 0.85:
-                            critical += 1
-                        elif conf >= 0.75:
-                            high += 1
-                        else:
-                            medium += 1
-
-                        x1, y1, x2, y2 = box.xyxy[0].tolist()
-                        width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
-                        pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
-                        total_maintenance_cost += pothole_cost
-
-                        pothole_label = f"B{total_potholes}"
-                        image_path = save_pothole_context_crop(batch_session_id, pothole_label, frame, x1, y1, x2, y2)
-
-                        pothole_dimensions.append({
-                            "id": pothole_label, "frame": frame_count, "confidence": conf,
-                            "width_cm": width_cm, "breadth_cm": breadth_cm, "depth_cm": depth_cm,
-                            "volume_m3": volume_m3, "estimated_cost": pothole_cost, "cost": pothole_cost, "image_path": image_path,
-                        })
-
-            frame_count += 1
+        try:
+            analysis = await asyncio.to_thread(analyze_video_file, file_path, batch_session_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
     finally:
-        if cap is not None:
-            cap.release()
         if os.path.exists(file_path):
             os.remove(file_path)
 
-    if pothole_dimensions and resolve_report_recipients(verified_email):
+    report_records = analysis["report_records"]
+    if report_records and resolve_report_recipients(verified_email):
         write_report_status(batch_session_id, {"status": "processing", "pdf_url": None, "error": None})
         threading.Thread(
             target=process_session_report,
-            args=(batch_session_id, pothole_dimensions, "Batch Video Upload", verified_email),
+            args=(batch_session_id, report_records, "Batch Video Upload", verified_email),
             daemon=True,
         ).start()
 
     return {
         "status": "success",
         "session_id": batch_session_id,
-        "total_frames_analyzed": frame_count // frame_skip,
-        "total_potholes": total_potholes,
-        "severity_breakdown": {"critical": critical, "high": high, "medium": medium},
-        "estimated_cost_inr": total_maintenance_cost,
-        "pothole_dimensions": pothole_dimensions,
+        "total_frames_analyzed": analysis["frames_analyzed"],
+        "total_potholes": analysis["total_potholes"],
+        "severity_breakdown": analysis["severity_breakdown"],
+        "estimated_cost_inr": analysis["total_maintenance_cost"],
+        "pothole_dimensions": analysis["public_records"],
     }
 
 # ===========================================================================
