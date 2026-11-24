@@ -1,20 +1,24 @@
 import traceback
+import re
+import socket
+import ipaddress
 import cv2
 import numpy as np
 import os
-import shutil
 import uuid
 import base64
 import asyncio
 import threading
 import smtplib
 import json
+from pathlib import Path
+from urllib.parse import urlparse
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException, Depends, Header, Query, status
 from fastapi.middleware.cors import CORSMiddleware
 from ultralytics import YOLO
 from dotenv import load_dotenv
@@ -28,12 +32,18 @@ load_dotenv()
 
 app = FastAPI(title="RoadGuard AI Backend", version="1.0")
 
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 print("Loading YOLOv11 Model...", flush=True)
@@ -72,7 +82,7 @@ def calculate_maintenance_cost(width_cm: float, breadth_cm: float, depth_cm: flo
 
 
 # ---------------------------------------------------------------------------
-# SESSION REPORT (PDF) + SUPABASE STORAGE + EMAIL CONFIG
+# SESSION REPORT (PDF) + SUPABASE STORAGE + EMAIL + SECURITY CONFIG
 # ---------------------------------------------------------------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -80,37 +90,58 @@ SUPABASE_BUCKET = os.getenv("SUPABASE_BUCKET", "pothole-reports")
 
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_APP_PASSWORD = os.getenv("SENDER_APP_PASSWORD")
+ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "").strip() or None
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+
+REQUIRE_AUTH = os.getenv("REQUIRE_AUTH", "true").strip().lower() == "true"
+ALLOWED_EMAIL_DOMAIN = (os.getenv("ALLOWED_EMAIL_DOMAIN") or "").strip().lower()
+ALLOW_LOCAL_CAM = os.getenv("ALLOW_LOCAL_CAM", "false").strip().lower() == "true"
+ALLOW_PRIVATE_CAM_IPS = os.getenv("ALLOW_PRIVATE_CAM_IPS", "false").strip().lower() == "true"
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "200"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
+SESSION_ID_PATTERN = re.compile(r"^[a-f0-9]{12}$")
 
 CAPTURES_DIR = "session_captures"
 REPORTS_DIR = "session_reports"
 os.makedirs(CAPTURES_DIR, exist_ok=True)
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
-# Unifying Report Status tracking
 report_status = {}
 
+
+def validate_session_id(session_id: str) -> str:
+    if not SESSION_ID_PATTERN.fullmatch(session_id):
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
+    return session_id
+
+
 def _status_file_path(session_id: str) -> str:
-    return os.path.join(REPORTS_DIR, f"{session_id}.status.json")
+    safe_id = validate_session_id(session_id)
+    return os.path.join(REPORTS_DIR, f"{safe_id}.status.json")
+
 
 def write_report_status(session_id: str, data: dict):
-    report_status[session_id] = data
+    safe_id = validate_session_id(session_id)
+    report_status[safe_id] = data
     try:
-        with open(_status_file_path(session_id), "w") as f:
+        with open(_status_file_path(safe_id), "w") as f:
             json.dump(data, f)
     except Exception as e:
-        print(f"[Report] failed to persist status file for {session_id}: {e}", flush=True)
+        print(f"[Report] failed to persist status file for {safe_id}: {e}", flush=True)
+
 
 def read_report_status(session_id: str):
-    path = _status_file_path(session_id)
+    safe_id = validate_session_id(session_id)
+    path = _status_file_path(safe_id)
     if os.path.exists(path):
         try:
             with open(path) as f:
                 return json.load(f)
         except Exception as e:
-            print(f"[Report] failed to read status file for {session_id}: {e}", flush=True)
-    return report_status.get(session_id)
+            print(f"[Report] failed to read status file for {safe_id}: {e}", flush=True)
+    return report_status.get(safe_id)
 
 
 supabase_client = None
@@ -123,9 +154,87 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     print("[Supabase] SUPABASE_URL/SUPABASE_KEY not set in .env — PDF upload to cloud will be skipped.", flush=True)
 
+
+async def verify_jwt_and_get_email(token: str | None) -> str | None:
+    """Verify Supabase JWT and enforce optional email domain restriction."""
+    if not REQUIRE_AUTH:
+        return None
+    if not supabase_client:
+        raise HTTPException(status_code=503, detail="Auth service unavailable (Supabase not configured)")
+    if not token:
+        raise HTTPException(status_code=401, detail="Missing authentication token")
+
+    try:
+        user_resp = await asyncio.to_thread(supabase_client.auth.get_user, token)
+        user = getattr(user_resp, "user", None)
+        email = (getattr(user, "email", None) or "").strip().lower()
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token")
+
+    if not email:
+        raise HTTPException(status_code=401, detail="Authenticated user has no email")
+    if ALLOWED_EMAIL_DOMAIN and not email.endswith(f"@{ALLOWED_EMAIL_DOMAIN}"):
+        raise HTTPException(status_code=403, detail=f"Email domain restricted to @{ALLOWED_EMAIL_DOMAIN}")
+
+    return email
+
+
+async def require_http_user(authorization: str | None = Header(default=None)) -> str | None:
+    if not REQUIRE_AUTH:
+        return None
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    return await verify_jwt_and_get_email(token)
+
+
+def validate_camera_url(raw_url):
+    """Prevent SSRF and local file reads via cv2.VideoCapture."""
+    if isinstance(raw_url, int) or (isinstance(raw_url, str) and raw_url.strip().isdigit()):
+        if not ALLOW_LOCAL_CAM:
+            raise ValueError("Local USB/webcam index access is disabled on this server.")
+        cam_idx = int(str(raw_url).strip())
+        if not (0 <= cam_idx <= 4):
+            raise ValueError("Camera index out of allowed range (0-4).")
+        return cam_idx
+
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        raise ValueError("Camera URL must be a non-empty string.")
+
+    url = raw_url.strip()
+    parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https", "rtsp", "rtsps"}:
+        raise ValueError("Only http, https, rtsp, and rtsps camera streams are allowed.")
+    if not parsed.hostname:
+        raise ValueError("Camera URL must include a valid host.")
+
+    try:
+        addr_infos = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        raise ValueError("Unable to resolve camera host.")
+
+    for info in addr_infos:
+        ip_obj = ipaddress.ip_address(info[4][0])
+        if (
+            ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_unspecified
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+        ):
+            raise ValueError("Camera URL points to a blocked internal/metadata address.")
+        if ip_obj.is_private and not ALLOW_PRIVATE_CAM_IPS:
+            raise ValueError("Private network camera IPs are disabled on this server.")
+
+    return url
+
+
 print(
     f"[Config] Supabase configured: {bool(supabase_client)} | "
     f"Email configured: {bool(SENDER_EMAIL and SENDER_APP_PASSWORD)} | "
+    f"ADMIN_EMAIL set: {bool(ADMIN_EMAIL)} | "
+    f"REQUIRE_AUTH={REQUIRE_AUTH} | "
+    f"ALLOWED_ORIGINS={ALLOWED_ORIGINS} | "
     f"SUPABASE_BUCKET={SUPABASE_BUCKET}",
     flush=True,
 )
@@ -334,14 +443,30 @@ def upload_pdf_to_supabase(pdf_path: str, session_id: str):
         return None
 
 
-def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count: int, receiver_email: str, pdf_url: str = None):
-    if not (SENDER_EMAIL and SENDER_APP_PASSWORD and receiver_email):
-        print(f"[Email] Skipping: Sender({bool(SENDER_EMAIL)}) AppPass({bool(SENDER_APP_PASSWORD)}) Receiver({bool(receiver_email)})", flush=True)
+def resolve_report_recipients(operator_email: str | None) -> list[str]:
+    recipients: list[str] = []
+    for addr in (operator_email, ADMIN_EMAIL):
+        cleaned = (addr or "").strip()
+        if cleaned and cleaned.lower() not in {r.lower() for r in recipients}:
+            recipients.append(cleaned)
+    return recipients
+
+
+def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count: int, receiver_email: str | None, pdf_url: str = None):
+    recipients = resolve_report_recipients(receiver_email)
+    if not (SENDER_EMAIL and SENDER_APP_PASSWORD and recipients):
+        print(
+            f"[Email] Skipping: Sender({bool(SENDER_EMAIL)}) "
+            f"AppPass({bool(SENDER_APP_PASSWORD)}) Recipients({len(recipients)})",
+            flush=True,
+        )
         return False
     try:
         msg = MIMEMultipart("alternative")
         msg["From"] = SENDER_EMAIL
-        msg["To"] = receiver_email
+        msg["To"] = recipients[0]
+        if len(recipients) > 1:
+            msg["Cc"] = ", ".join(recipients[1:])
         msg["Subject"] = f"RoadGuard AI Report — {pothole_count} potholes, Rs. {total_cost}"
 
         text_body = (
@@ -436,14 +561,14 @@ def send_report_email(pdf_path: str, session_id: str, total_cost, pothole_count:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_APP_PASSWORD)
             server.send_message(msg)
-        print(f"[Email] Sent successfully to {receiver_email}", flush=True)
+        print(f"[Email] Sent successfully to {', '.join(recipients)}", flush=True)
         return True
     except Exception as e:
         print(f"[Email] sending failed: {e}", flush=True)
         return False
 
 
-def process_session_report(session_id: str, pothole_list: list, source: str, receiver_email: str):
+def process_session_report(session_id: str, pothole_list: list, source: str, receiver_email: str | None):
     try:
         pdf_path, total_cost = build_pdf_report(session_id, pothole_list, source=source)
         pdf_url = upload_pdf_to_supabase(pdf_path, session_id)
@@ -466,18 +591,28 @@ def process_session_report(session_id: str, pothole_list: list, source: str, rec
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
 # ===========================================================================
 @app.websocket("/ws/drone-stream")
-async def drone_stream_websocket(websocket: WebSocket, email: str = None):
+async def drone_stream_websocket(websocket: WebSocket, token: str | None = Query(default=None)):
+    try:
+        verified_email = await verify_jwt_and_get_email(token)
+    except HTTPException as exc:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.detail)
+        return
+
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
-    
+
     try:
         init_data = await asyncio.wait_for(websocket.receive_json(), timeout=2.0)
-        camera_url = init_data.get("camera_url", DRONE_IP_CAM_URL)
+        raw_camera_url = init_data.get("camera_url", DRONE_IP_CAM_URL)
     except Exception:
-        camera_url = DRONE_IP_CAM_URL
+        raw_camera_url = DRONE_IP_CAM_URL
 
-    if str(camera_url).isdigit(): 
-        camera_url = int(camera_url)
+    try:
+        camera_url = validate_camera_url(raw_camera_url)
+    except ValueError as exc:
+        await websocket.send_json({"error": str(exc)})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
 
     print(f"Connecting to Drone Camera Stream at: {camera_url} | session_id={session_id}", flush=True)
     cap = cv2.VideoCapture(camera_url)
@@ -564,11 +699,11 @@ async def drone_stream_websocket(websocket: WebSocket, email: str = None):
         pothole_list = list(session_pothole_data.values())
         total = sum(p["cost"] for p in pothole_list)
         print(f"Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list and email:
+        if pothole_list and resolve_report_recipients(verified_email):
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Live IP Camera", email), daemon=True
+                    target=process_session_report, args=(session_id, pothole_list, "Live IP Camera", verified_email), daemon=True
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
@@ -577,7 +712,13 @@ async def drone_stream_websocket(websocket: WebSocket, email: str = None):
 # 2. PUSH MODEL (NEW USP): WEBSOCKET FOR DEVICE BROWSER CAMERA
 # ===========================================================================
 @app.websocket("/ws/device-stream")
-async def device_stream_websocket(websocket: WebSocket, email: str = None):
+async def device_stream_websocket(websocket: WebSocket, token: str | None = Query(default=None)):
+    try:
+        verified_email = await verify_jwt_and_get_email(token)
+    except HTTPException as exc:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.detail)
+        return
+
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
     print(f"Connecting to Device Browser Camera Stream | session_id={session_id}", flush=True)
@@ -655,95 +796,142 @@ async def device_stream_websocket(websocket: WebSocket, email: str = None):
         pothole_list = list(session_pothole_data.values())
         total = sum(p["cost"] for p in pothole_list)
         print(f"Device Session {session_id} ended. Unique potholes: {len(pothole_list)} | Total cost: ₹{total}", flush=True)
-        if pothole_list and email:
+        if pothole_list and resolve_report_recipients(verified_email):
             try:
                 write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
                 threading.Thread(
-                    target=process_session_report, args=(session_id, pothole_list, "Local Device Browser Camera", email), daemon=True
+                    target=process_session_report, args=(session_id, pothole_list, "Local Device Browser Camera", verified_email), daemon=True
                 ).start()
             except Exception as e:
                 write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
-        elif not email:
-            print(f"[Warning] Session {session_id} ended without email in URL. Skipping report generation.", flush=True)
+        elif pothole_list:
+            print(f"[Warning] Session {session_id} ended with no recipient email configured. Skipping report generation.", flush=True)
 
 # ===========================================================================
 # 3. BATCH UPLOAD FOR LARGE 100MB+ RECORDED VIDEOS
 # ===========================================================================
 @app.post("/api/v1/analyze-video")
-async def analyze_video(file: UploadFile = File(...), email: str = None):
-    file_ext = file.filename.split('.')[-1]
-    unique_filename = f"{uuid.uuid4()}.{file_ext}"
-    file_path = f"temp_uploads/{unique_filename}"
-    
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-        
-    cap = cv2.VideoCapture(file_path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30
-    frame_skip = int(fps)
-    
-    total_potholes = 0
-    critical, high, medium = 0, 0, 0
-    frame_count = 0
-    total_maintenance_cost = 0
-    pothole_dimensions = []  
-    batch_session_id = uuid.uuid4().hex[:12]
-    
-    while cap.isOpened():
-        success, frame = cap.read()
-        if not success:
-            break
-            
-        if frame_count % frame_skip == 0:
-            results = model(frame, conf=0.60, verbose=False)
-            if results[0].boxes:
-                for box in results[0].boxes:
-                    total_potholes += 1
-                    conf = float(box.conf[0])
-                    
-                    if conf >= 0.85: critical += 1
-                    elif conf >= 0.75: high += 1
-                    else: medium += 1
+async def analyze_video(
+    file: UploadFile = File(...),
+    verified_email: str | None = Depends(require_http_user),
+):
+    original_name = Path(file.filename or "").name
+    file_ext = Path(original_name).suffix.lower()
+    if file_ext not in ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported video format '{file_ext or 'unknown'}'. Allowed: {', '.join(sorted(ALLOWED_VIDEO_EXTENSIONS))}",
+        )
+    if file.content_type and not (
+        file.content_type.startswith("video/") or file.content_type == "application/octet-stream"
+    ):
+        raise HTTPException(status_code=400, detail=f"Invalid content type: {file.content_type}")
 
-                    x1, y1, x2, y2 = box.xyxy[0].tolist()
-                    width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
-                    pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
-                    total_maintenance_cost += pothole_cost
+    unique_filename = f"{uuid.uuid4().hex}{file_ext}"
+    file_path = os.path.join("temp_uploads", unique_filename)
 
-                    pothole_label = f"B{total_potholes}"
-                    image_path = save_pothole_context_crop(batch_session_id, pothole_label, frame, x1, y1, x2, y2)
+    total_bytes = 0
+    chunk_size = 1024 * 1024  # 1 MB chunks
+    cap = None
+    try:
+        with open(file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(chunk_size)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Video exceeds maximum allowed size of {MAX_UPLOAD_MB} MB.",
+                    )
+                buffer.write(chunk)
 
-                    pothole_dimensions.append({
-                        "id": pothole_label, "frame": frame_count, "confidence": conf,
-                        "width_cm": width_cm, "breadth_cm": breadth_cm, "depth_cm": depth_cm,
-                        "volume_m3": volume_m3, "estimated_cost": pothole_cost,"cost": pothole_cost, "image_path": image_path,
-                    })
-                    
-        frame_count += 1
-        
-    cap.release()
-    os.remove(file_path)
+        if total_bytes == 0:
+            raise HTTPException(status_code=400, detail="Uploaded video file is empty.")
 
-    if pothole_dimensions and email:
+        cap = cv2.VideoCapture(file_path)
+        if not cap.isOpened():
+            raise HTTPException(status_code=400, detail="Could not decode uploaded video file.")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        frame_skip = max(1, int(fps))
+
+        total_potholes = 0
+        critical, high, medium = 0, 0, 0
+        frame_count = 0
+        total_maintenance_cost = 0
+        pothole_dimensions = []
+        batch_session_id = uuid.uuid4().hex[:12]
+
+        while cap.isOpened():
+            success, frame = cap.read()
+            if not success:
+                break
+
+            if frame_count % frame_skip == 0:
+                results = model(frame, conf=0.60, verbose=False)
+                if results[0].boxes:
+                    for box in results[0].boxes:
+                        total_potholes += 1
+                        conf = float(box.conf[0])
+
+                        if conf >= 0.85:
+                            critical += 1
+                        elif conf >= 0.75:
+                            high += 1
+                        else:
+                            medium += 1
+
+                        x1, y1, x2, y2 = box.xyxy[0].tolist()
+                        width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(x1, y1, x2, y2, conf)
+                        pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
+                        total_maintenance_cost += pothole_cost
+
+                        pothole_label = f"B{total_potholes}"
+                        image_path = save_pothole_context_crop(batch_session_id, pothole_label, frame, x1, y1, x2, y2)
+
+                        pothole_dimensions.append({
+                            "id": pothole_label, "frame": frame_count, "confidence": conf,
+                            "width_cm": width_cm, "breadth_cm": breadth_cm, "depth_cm": depth_cm,
+                            "volume_m3": volume_m3, "estimated_cost": pothole_cost, "cost": pothole_cost, "image_path": image_path,
+                        })
+
+            frame_count += 1
+    finally:
+        if cap is not None:
+            cap.release()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    if pothole_dimensions and resolve_report_recipients(verified_email):
         write_report_status(batch_session_id, {"status": "processing", "pdf_url": None, "error": None})
         threading.Thread(
             target=process_session_report,
-            args=(batch_session_id, pothole_dimensions, "Batch Video Upload", email),
+            args=(batch_session_id, pothole_dimensions, "Batch Video Upload", verified_email),
             daemon=True,
         ).start()
 
     return {
-        "status": "success", "session_id": batch_session_id, "total_frames_analyzed": frame_count // frame_skip,
-        "total_potholes": total_potholes, "severity_breakdown": {"critical": critical, "high": high, "medium": medium},
-        "estimated_cost_inr": total_maintenance_cost, "pothole_dimensions": pothole_dimensions
+        "status": "success",
+        "session_id": batch_session_id,
+        "total_frames_analyzed": frame_count // frame_skip,
+        "total_potholes": total_potholes,
+        "severity_breakdown": {"critical": critical, "high": high, "medium": medium},
+        "estimated_cost_inr": total_maintenance_cost,
+        "pothole_dimensions": pothole_dimensions,
     }
 
 # ===========================================================================
 # 4. REPORT STATUS API
 # ===========================================================================
 @app.get("/api/v1/reports/{session_id}/status")
-def get_report_status(session_id: str):
-    status_data = read_report_status(session_id)
+async def get_report_status(
+    session_id: str,
+    _: str | None = Depends(require_http_user),
+):
+    safe_id = validate_session_id(session_id)
+    status_data = read_report_status(safe_id)
     if not status_data:
         raise HTTPException(status_code=404, detail="Report status not found")
     return status_data
