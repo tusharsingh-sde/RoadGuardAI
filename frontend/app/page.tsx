@@ -58,6 +58,8 @@ const getBackendWsBase = () => {
 
 const FALLBACK_LOCATION: [number, number] = [28.9731, 77.6833];
 const FALLBACK_ADDRESS = "MIET, NH58, Meerut (GPS Offline)";
+const SUPABASE_BUCKET =
+  (process.env.NEXT_PUBLIC_SUPABASE_BUCKET || "pothole-reports").trim();
 
 type SidebarView = "live" | "history" | "uploads" | "reports";
 
@@ -148,6 +150,8 @@ export default function DashboardPage() {
   const [historicalLogs, setHistoricalLogs] = useState<PotholeLog[]>([]);
   const [detectionCount, setDetectionCount] = useState(0);
   const [sessionCost, setSessionCost] = useState(0);
+  const [historyRefreshKey, setHistoryRefreshKey] = useState(0);
+  const [reportRefreshKey, setReportRefreshKey] = useState(0);
 
   const [isUploading, setIsUploading] = useState(false);
   const [uploadProgressText, setUploadProgressText] = useState("");
@@ -341,6 +345,7 @@ export default function DashboardPage() {
             potholeCount: data.pothole_count,
             emailSent: data.email_sent,
           });
+          setReportRefreshKey((k) => k + 1);
           return;
         }
         if (data.status === "skipped") {
@@ -498,6 +503,8 @@ export default function DashboardPage() {
       ]);
       if (error) {
         console.error("Database save failed:", error);
+      } else {
+        setHistoryRefreshKey((k) => k + 1);
       }
     } catch (err) {
       console.error("Supabase Error:", err);
@@ -601,12 +608,16 @@ export default function DashboardPage() {
     clearSessionMetrics();
 
     const token = await getAccessToken();
-    const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-    const socket = new WebSocket(`${getBackendWsBase()}/ws/drone-stream${qs}`);
+    const socket = new WebSocket(`${getBackendWsBase()}/ws/drone-stream`);
     wsRef.current = socket;
 
     socket.onopen = () => {
-      socket.send(JSON.stringify({ camera_url: ipCamUrl.trim() }));
+      socket.send(
+        JSON.stringify({
+          token,
+          camera_url: ipCamUrl.trim(),
+        })
+      );
       isStreamingDroneRef.current = true;
       setIsStreamingDrone(true);
       setSessionStarted(true);
@@ -650,11 +661,11 @@ export default function DashboardPage() {
       }
 
       const token = await getAccessToken();
-      const qs = token ? `?token=${encodeURIComponent(token)}` : "";
-      const socket = new WebSocket(`${getBackendWsBase()}/ws/device-stream${qs}`);
+      const socket = new WebSocket(`${getBackendWsBase()}/ws/device-stream`);
       wsRef.current = socket;
 
       socket.onopen = () => {
+        socket.send(JSON.stringify({ type: "auth", token }));
         isStreamingDeviceRef.current = true;
         isWaitingForBackendRef.current = false;
         setIsStreamingDevice(true);
@@ -813,6 +824,49 @@ export default function DashboardPage() {
     await saveSessionToHistory(finalCount, finalCost, finalAddress);
   };
 
+  const exportGeotagsGeoJson = () => {
+    if (historicalLogs.length === 0) return;
+
+    const featureCollection = {
+      type: "FeatureCollection",
+      metadata: {
+        exported_at: new Date().toISOString(),
+        zone: liveAddressRef.current,
+        total_potholes: detectionCount,
+        total_estimated_cost_inr: sessionCost,
+      },
+      features: historicalLogs.map((log) => ({
+        type: "Feature",
+        geometry: {
+          type: "Point",
+          coordinates: [log.lng, log.lat],
+        },
+        properties: {
+          id: log.id,
+          severity: log.severity,
+          confidence: Number(log.confidence.toFixed(4)),
+          width_cm: log.width_cm ?? null,
+          breadth_cm: log.breadth_cm ?? null,
+          depth_cm: log.depth_cm ?? null,
+          estimated_cost_inr: log.cost,
+          detected_at: log.time,
+        },
+      })),
+    };
+
+    const blob = new Blob([JSON.stringify(featureCollection, null, 2)], {
+      type: "application/geo+json",
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `roadguard-geotags-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.geojson`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
   const resetSession = () => {
     stopDroneStream(false);
     stopDeviceCamera(false);
@@ -961,6 +1015,7 @@ export default function DashboardPage() {
             fileUploadRef={fileUploadRef}
             userLocation={userLocation}
             liveAddress={liveAddress}
+            exportGeotagsGeoJson={exportGeotagsGeoJson}
           />
         )}
 
@@ -977,6 +1032,7 @@ export default function DashboardPage() {
             reportState={reportState}
             sessionCost={sessionCost}
             detectionCount={detectionCount}
+            reportRefreshKey={reportRefreshKey}
           />
         )}
 
@@ -984,6 +1040,7 @@ export default function DashboardPage() {
           <HistoryView
             historicalLogs={historicalLogs}
             isAnyStreamActive={isAnyStreamActive}
+            historyRefreshKey={historyRefreshKey}
           />
         )}
 
@@ -1065,6 +1122,28 @@ export default function DashboardPage() {
           </div>
         )}
       </section>
+
+      <nav className="mobile-nav" aria-label="Mobile Navigation">
+        {NAV_ITEMS.map((item) => (
+          <button
+            key={item.key}
+            type="button"
+            className={`mobile-nav-item ${activeView === item.key ? "active" : ""}`}
+            onClick={() => setActiveView(item.key)}
+          >
+            <span className="nav-icon">{item.icon}</span>
+            <span>{item.label.split(" ")[0]}</span>
+          </button>
+        ))}
+        <button
+          type="button"
+          className="mobile-nav-item logout"
+          onClick={handleLogout}
+        >
+          <span className="nav-icon">{"→"}</span>
+          <span>Logout</span>
+        </button>
+      </nav>
     </main>
   );
 }
@@ -1096,6 +1175,7 @@ function LiveDetectionView(props: {
   hiddenCanvasRef: React.RefObject<HTMLCanvasElement | null>;
   userLocation: [number, number] | null;
   liveAddress: string;
+  exportGeotagsGeoJson: () => void;
 }) {
   const {
     isUploading,
@@ -1124,6 +1204,7 @@ function LiveDetectionView(props: {
     hiddenCanvasRef,
     userLocation,
     liveAddress,
+    exportGeotagsGeoJson,
   } = props;
 
   return (
@@ -1416,11 +1497,19 @@ function LiveDetectionView(props: {
         <div className="card-header">
           <div>
             <h3>Session Controls</h3>
-            <p>Reset active session state</p>
+            <p>Export geotagged detections or reset current session</p>
           </div>
         </div>
         <div className="session-actions">
-          <button className="btn" onClick={resetSession}>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={exportGeotagsGeoJson}
+            disabled={historicalLogs.length === 0}
+          >
+            {"▣"} Export Geotags (GeoJSON)
+          </button>
+          <button type="button" className="btn" onClick={resetSession}>
             {"↻"} Reset Session
           </button>
         </div>
@@ -1581,15 +1670,103 @@ function VideoUploadsView({
   );
 }
 
+interface StoredReport {
+  name: string;
+  createdAt: string | null;
+  sizeBytes: number | null;
+  url: string;
+}
+
+interface SavedSessionRow {
+  id: number;
+  location_address: string | null;
+  total_potholes: number;
+  estimated_cost: number;
+  session_date: string;
+}
+
 function ReportsView({
   reportState,
   sessionCost,
   detectionCount,
+  reportRefreshKey,
 }: {
   reportState: ReportState;
   sessionCost: number;
   detectionCount: number;
+  reportRefreshKey: number;
 }) {
+  const [storedReports, setStoredReports] = useState<StoredReport[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const fetchStoredReports = useCallback(async (): Promise<StoredReport[]> => {
+    const { data, error } = await supabase.storage
+      .from(SUPABASE_BUCKET)
+      .list("", {
+        limit: 50,
+        sortBy: { column: "created_at", order: "desc" },
+      });
+
+    if (error) throw new Error(error.message);
+
+    return (data || [])
+      .filter((item) => item.name.toLowerCase().endsWith(".pdf"))
+      .map((item) => {
+        const { data: urlData } = supabase.storage
+          .from(SUPABASE_BUCKET)
+          .getPublicUrl(item.name);
+        const rawSize =
+          item.metadata && typeof item.metadata.size === "number"
+            ? item.metadata.size
+            : null;
+        return {
+          name: item.name,
+          createdAt: item.created_at ?? null,
+          sizeBytes: rawSize,
+          url: urlData.publicUrl,
+        };
+      });
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchStoredReports()
+      .then((items) => {
+        if (!active) return;
+        setStoredReports(items);
+        setLoadError(null);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setLoadError(
+          err instanceof Error ? err.message : "Could not load stored PDF reports."
+        );
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [fetchStoredReports, reportRefreshKey]);
+
+  const handleRefresh = async () => {
+    setLoading(true);
+    try {
+      const items = await fetchStoredReports();
+      setStoredReports(items);
+      setLoadError(null);
+    } catch (err: unknown) {
+      setLoadError(
+        err instanceof Error ? err.message : "Could not load stored PDF reports."
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <>
       <header className="topbar">
@@ -1597,18 +1774,11 @@ function ReportsView({
           <div className="page-title-row">
             <h2>PDFs / Reports</h2>
           </div>
-          <p className="subtitle">Latest generated inspection report</p>
+          <p className="subtitle">Latest session report and archived cloud PDFs</p>
         </div>
       </header>
 
-      {reportState.status === "idle" ? (
-        <div className="not-available">
-          <h3>No report generated yet</h3>
-          <p>
-            Run a live detection session or upload a video to automatically generate a PDF report.
-          </p>
-        </div>
-      ) : (
+      {reportState.status !== "idle" && (
         <ReportPanel
           reportState={reportState}
           sessionCost={sessionCost}
@@ -1616,6 +1786,84 @@ function ReportsView({
           isAnyStreamActive={false}
         />
       )}
+
+      <section className="panel" style={{ marginTop: 16 }}>
+        <div className="card-header">
+          <div>
+            <h3>Cloud Report Archive</h3>
+            <p>PDF reports stored in Supabase ({SUPABASE_BUCKET})</p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={handleRefresh}
+            disabled={loading}
+          >
+            {loading ? "Refreshing..." : "↻ Refresh"}
+          </button>
+        </div>
+
+        {loadError ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"⚠️"}</div>
+            <h3>Unable to list cloud reports</h3>
+            <p>{loadError}</p>
+          </div>
+        ) : loading ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"⏳"}</div>
+            <h3>Loading archived reports...</h3>
+          </div>
+        ) : storedReports.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"📄"}</div>
+            <h3>No archived PDFs yet</h3>
+            <p>Complete a live session or batch video upload to generate your first PDF report.</p>
+          </div>
+        ) : (
+          <div className="session-table-wrap">
+            <table className="session-table">
+              <thead>
+                <tr>
+                  <th>Report File</th>
+                  <th>Generated</th>
+                  <th>Size</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody>
+                {storedReports.map((rep) => (
+                  <tr key={rep.name}>
+                    <td>
+                      <strong>{rep.name}</strong>
+                    </td>
+                    <td>
+                      {rep.createdAt
+                        ? new Date(rep.createdAt).toLocaleString("en-IN")
+                        : "—"}
+                    </td>
+                    <td>
+                      {rep.sizeBytes !== null
+                        ? `${(rep.sizeBytes / 1024).toFixed(1)} KB`
+                        : "—"}
+                    </td>
+                    <td>
+                      <a
+                        href={rep.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="btn btn-primary btn-sm"
+                      >
+                        {"⬇"} Open PDF
+                      </a>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
     </>
   );
 }
@@ -1623,10 +1871,65 @@ function ReportsView({
 function HistoryView({
   historicalLogs,
   isAnyStreamActive,
+  historyRefreshKey,
 }: {
   historicalLogs: PotholeLog[];
   isAnyStreamActive: boolean;
+  historyRefreshKey: number;
 }) {
+  const [savedSessions, setSavedSessions] = useState<SavedSessionRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const fetchSessionHistory = useCallback(async (): Promise<SavedSessionRow[]> => {
+    const { data, error } = await supabase
+      .from("session_history")
+      .select("id, location_address, total_potholes, estimated_cost, session_date")
+      .order("session_date", { ascending: false })
+      .limit(50);
+
+    if (error) throw new Error(error.message);
+    return (data || []) as SavedSessionRow[];
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchSessionHistory()
+      .then((rows) => {
+        if (!active) return;
+        setSavedSessions(rows);
+        setLoadError(null);
+      })
+      .catch((err: unknown) => {
+        if (!active) return;
+        setLoadError(
+          err instanceof Error ? err.message : "Could not load session history."
+        );
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [fetchSessionHistory, historyRefreshKey]);
+
+  const handleRefresh = async () => {
+    setLoading(true);
+    try {
+      const rows = await fetchSessionHistory();
+      setSavedSessions(rows);
+      setLoadError(null);
+    } catch (err: unknown) {
+      setLoadError(
+        err instanceof Error ? err.message : "Could not load session history."
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <>
       <header className="topbar">
@@ -1634,7 +1937,7 @@ function HistoryView({
           <div className="page-title-row">
             <h2>History</h2>
           </div>
-          <p className="subtitle">Detections logged during the current inspection</p>
+          <p className="subtitle">Active detections and past saved inspection sessions</p>
         </div>
       </header>
 
@@ -1642,16 +1945,16 @@ function HistoryView({
         <div className="card-header">
           <div>
             <h3>Current Session Log</h3>
-            <p>Verified pothole detections</p>
+            <p>Verified pothole detections in this session</p>
           </div>
         </div>
         {historicalLogs.length === 0 ? (
           <div className="empty-state">
             <div className="empty-icon">{"◉"}</div>
-            <h3>No defects logged yet</h3>
+            <h3>No defects logged in current session</h3>
           </div>
         ) : (
-          <div className="detection-list" style={{ maxHeight: 420, overflowY: "auto" }}>
+          <div className="detection-list" style={{ maxHeight: 360, overflowY: "auto" }}>
             {historicalLogs.map((log) => (
               <div className="detection-item" key={String(log.id)}>
                 <div className="detection-info">
@@ -1668,6 +1971,67 @@ function HistoryView({
                 </div>
               </div>
             ))}
+          </div>
+        )}
+      </section>
+
+      <section className="panel" style={{ marginTop: 16 }}>
+        <div className="card-header">
+          <div>
+            <h3>Past Inspection Sessions</h3>
+            <p>Saved records from Supabase (session_history)</p>
+          </div>
+          <button
+            type="button"
+            className="btn btn-sm"
+            onClick={handleRefresh}
+            disabled={loading}
+          >
+            {loading ? "Refreshing..." : "↻ Refresh"}
+          </button>
+        </div>
+
+        {loadError ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"⚠️"}</div>
+            <h3>Unable to load past sessions</h3>
+            <p>{loadError}</p>
+          </div>
+        ) : loading ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"⏳"}</div>
+            <h3>Loading inspection history...</h3>
+          </div>
+        ) : savedSessions.length === 0 ? (
+          <div className="empty-state">
+            <div className="empty-icon">{"🕒"}</div>
+            <h3>No saved sessions yet</h3>
+            <p>End a live session or complete a video upload to persist results here.</p>
+          </div>
+        ) : (
+          <div className="session-table-wrap">
+            <table className="session-table">
+              <thead>
+                <tr>
+                  <th>Date & Time</th>
+                  <th>Zone / Location</th>
+                  <th>Potholes</th>
+                  <th>Est. Cost</th>
+                </tr>
+              </thead>
+              <tbody>
+                {savedSessions.map((row) => (
+                  <tr key={row.id}>
+                    <td>{new Date(row.session_date).toLocaleString("en-IN")}</td>
+                    <td>{row.location_address || "Unknown location"}</td>
+                    <td>
+                      <strong>{row.total_potholes}</strong>
+                    </td>
+                    <td>₹{Number(row.estimated_cost || 0).toLocaleString("en-IN")}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </section>

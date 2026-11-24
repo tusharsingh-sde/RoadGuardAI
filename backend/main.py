@@ -737,6 +737,7 @@ def process_session_report(session_id: str, pothole_list: list, source: str, rec
             "pothole_count": len(pothole_list),
             "email_sent": email_sent,
             "error": None,
+            "owner_email": receiver_email,
         })
         print(
             f"[Report] {session_id} ready. Potholes={len(pothole_list)} "
@@ -746,7 +747,12 @@ def process_session_report(session_id: str, pothole_list: list, source: str, rec
     except Exception as e:
         print(f"[Report] generation failed for {session_id}: {e}", flush=True)
         traceback.print_exc()
-        write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+        write_report_status(session_id, {
+            "status": "error",
+            "pdf_url": None,
+            "error": str(e),
+            "owner_email": receiver_email,
+        })
     finally:
         cleanup_session_captures(session_id)
 
@@ -767,12 +773,18 @@ def schedule_session_report(
             "pothole_count": 0,
             "email_sent": False,
             "error": None,
+            "owner_email": verified_email,
         })
         cleanup_session_captures(session_id)
         return
 
     try:
-        write_report_status(session_id, {"status": "processing", "pdf_url": None, "error": None})
+        write_report_status(session_id, {
+            "status": "processing",
+            "pdf_url": None,
+            "error": None,
+            "owner_email": verified_email,
+        })
         get_report_executor().submit(
             process_session_report,
             session_id,
@@ -781,7 +793,12 @@ def schedule_session_report(
             verified_email,
         )
     except Exception as e:
-        write_report_status(session_id, {"status": "error", "pdf_url": None, "error": str(e)})
+        write_report_status(session_id, {
+            "status": "error",
+            "pdf_url": None,
+            "error": str(e),
+            "owner_email": verified_email,
+        })
         cleanup_session_captures(session_id)
 
 # ---------------------------------------------------------------------------
@@ -1006,27 +1023,39 @@ def analyze_video_file(file_path: str, batch_session_id: str):
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
 # ===========================================================================
 @app.websocket("/ws/drone-stream")
-async def drone_stream_websocket(websocket: WebSocket, token: str | None = Query(default=None)):
-    try:
-        verified_email = await verify_jwt_and_get_email(token)
-    except HTTPException as exc:
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.detail)
-        return
-
+async def drone_stream_websocket(websocket: WebSocket):
     await websocket.accept()
     session_id = uuid.uuid4().hex[:12]
 
     try:
-        init_data = await asyncio.wait_for(websocket.receive_json(), timeout=2.0)
-        raw_camera_url = init_data.get("camera_url", DRONE_IP_CAM_URL)
+        init_data = await asyncio.wait_for(websocket.receive_json(), timeout=5.0)
+        if not isinstance(init_data, dict):
+            raise ValueError("Invalid handshake payload.")
+    except asyncio.TimeoutError:
+        if REQUIRE_AUTH:
+            await websocket.send_json({"error": "Authentication handshake timed out."})
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication timeout")
+            return
+        init_data = {}
     except Exception:
-        raw_camera_url = DRONE_IP_CAM_URL
+        await websocket.send_json({"error": "Invalid initial handshake payload."})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid handshake")
+        return
+
+    try:
+        verified_email = await verify_jwt_and_get_email(init_data.get("token"))
+    except HTTPException as exc:
+        await websocket.send_json({"error": exc.detail})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.detail)
+        return
+
+    raw_camera_url = init_data.get("camera_url", DRONE_IP_CAM_URL)
 
     try:
         camera_url = validate_camera_url(raw_camera_url)
     except ValueError as exc:
         await websocket.send_json({"error": str(exc)})
-        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=str(exc))
         return
 
     print(f"Connecting to Drone Camera Stream at: {camera_url} | session_id={session_id}", flush=True)
@@ -1087,15 +1116,31 @@ async def drone_stream_websocket(websocket: WebSocket, token: str | None = Query
 # 2. PUSH MODEL (NEW USP): WEBSOCKET FOR DEVICE BROWSER CAMERA
 # ===========================================================================
 @app.websocket("/ws/device-stream")
-async def device_stream_websocket(websocket: WebSocket, token: str | None = Query(default=None)):
+async def device_stream_websocket(websocket: WebSocket):
+    await websocket.accept()
+    session_id = uuid.uuid4().hex[:12]
+
     try:
-        verified_email = await verify_jwt_and_get_email(token)
+        raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=5.0)
+        auth_data = json.loads(raw_auth)
+        if not isinstance(auth_data, dict) or auth_data.get("type") != "auth":
+            raise ValueError("First message must be an auth payload.")
+    except asyncio.TimeoutError:
+        await websocket.send_json({"error": "Authentication handshake timed out."})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Authentication timeout")
+        return
+    except Exception as exc:
+        await websocket.send_json({"error": str(exc)})
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason="Invalid auth handshake")
+        return
+
+    try:
+        verified_email = await verify_jwt_and_get_email(auth_data.get("token"))
     except HTTPException as exc:
+        await websocket.send_json({"error": exc.detail})
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION, reason=exc.detail)
         return
 
-    await websocket.accept()
-    session_id = uuid.uuid4().hex[:12]
     print(f"Connecting to Device Browser Camera Stream | session_id={session_id}", flush=True)
 
     session_model = await asyncio.to_thread(create_session_model)
@@ -1217,13 +1262,21 @@ async def analyze_video(
 @app.get("/api/v1/reports/{session_id}/status")
 async def get_report_status(
     session_id: str,
-    _: str | None = Depends(require_http_user),
+    caller_email: str | None = Depends(require_http_user),
 ):
     safe_id = validate_session_id(session_id)
     status_data = read_report_status(safe_id)
     if not status_data:
         raise HTTPException(status_code=404, detail="Report status not found")
-    return status_data
+
+    if REQUIRE_AUTH:
+        owner = (status_data.get("owner_email") or "").strip().lower()
+        caller = (caller_email or "").strip().lower()
+        admin = (ADMIN_EMAIL or "").strip().lower()
+        if owner and caller not in {owner, admin}:
+            raise HTTPException(status_code=403, detail="Not authorized to access this report")
+
+    return {k: v for k, v in status_data.items() if k != "owner_email"}
 
 
 # ===========================================================================
