@@ -15,6 +15,7 @@ import asyncio
 import threading
 import smtplib
 import json
+import requests
 from pathlib import Path
 from urllib.parse import urlparse
 from datetime import datetime
@@ -1019,6 +1020,204 @@ def analyze_video_file(file_path: str, batch_session_id: str):
     }
 
 
+class ZeroBufferFrameGrabber:
+    """
+    Zero-buffer camera frame reader:
+    - If HTTP IP Webcam ending in /video and replacing /video with /shot.jpg returns HTTP 200,
+      polls /shot.jpg via a persistent requests.Session() (keep-alive) in a daemon reader thread,
+      eliminating MJPEG/FFmpeg stream buffering completely.
+    - Otherwise (RTSP/USB/other streams), uses cv2.VideoCapture with
+      OPENCV_FFMPEG_CAPTURE_OPTIONS="fflags;nobuffer|flags;low_delay" and CAP_PROP_BUFFERSIZE=1
+      inside a daemon reader thread that continuously drains frames and keeps only the single latest frame.
+    """
+    def __init__(self, camera_url):
+        self.camera_url = camera_url
+        self.is_ipwebcam_shot = False
+        self.shot_url = None
+        self.cap = None
+        self.http_session = None
+        self.stop_event = threading.Event()
+        self.error_event = threading.Event()
+        self.error_message = None
+        self.lock = threading.Lock()
+        self.latest_frame = None
+        self.frame_id = 0
+        self.thread = None
+
+    def start(self) -> bool:
+        if isinstance(self.camera_url, str) and (
+            self.camera_url.startswith("http://") or self.camera_url.startswith("https://")
+        ) and "/video" in self.camera_url:
+            candidate_shot = re.sub(r"/video(?:/|\?.*)?$", "/shot.jpg", self.camera_url)
+            if not candidate_shot or candidate_shot == self.camera_url:
+                candidate_shot = self.camera_url.replace("/video", "/shot.jpg")
+            try:
+                probe = requests.get(candidate_shot, timeout=2.0)
+                if probe.status_code == 200 and len(probe.content) > 500:
+                    self.is_ipwebcam_shot = True
+                    self.shot_url = candidate_shot
+                    print(f"[FrameGrabber] Detected IP Webcam MJPEG stream. Polling /shot.jpg with zero buffer: {self.shot_url}", flush=True)
+            except Exception as e:
+                print(f"[FrameGrabber] /shot.jpg probe skipped/failed ({e}), falling back to OpenCV VideoCapture.", flush=True)
+                self.is_ipwebcam_shot = False
+
+        if self.is_ipwebcam_shot:
+            self.http_session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(max_retries=0, pool_connections=1, pool_maxsize=2)
+            self.http_session.mount("http://", adapter)
+            self.http_session.mount("https://", adapter)
+            try:
+                resp = self.http_session.get(self.shot_url, timeout=3.0)
+                if resp.status_code == 200 and resp.content:
+                    arr = np.frombuffer(resp.content, dtype=np.uint8)
+                    init_frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if init_frame is not None:
+                        self.latest_frame = init_frame
+                        self.frame_id = 1
+                    else:
+                        return False
+                else:
+                    return False
+            except Exception as e:
+                print(f"[FrameGrabber] Failed to grab initial frame from /shot.jpg: {e}", flush=True)
+                return False
+
+            self.thread = threading.Thread(target=self._ipwebcam_worker, daemon=True)
+            self.thread.start()
+            return True
+        else:
+            os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "fflags;nobuffer|flags;low_delay"
+            self.cap = cv2.VideoCapture(self.camera_url)
+            if not self.cap.isOpened():
+                return False
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            ret, init_frame = self.cap.read()
+            if not ret or init_frame is None:
+                self.cap.release()
+                self.cap = None
+                return False
+
+            self.latest_frame = init_frame
+            self.frame_id = 1
+
+            self.thread = threading.Thread(target=self._opencv_worker, daemon=True)
+            self.thread.start()
+            return True
+
+    def _ipwebcam_worker(self):
+        consecutive_failures = 0
+        while not self.stop_event.is_set():
+            try:
+                resp = self.http_session.get(self.shot_url, timeout=2.0)
+                if resp.status_code == 200 and resp.content:
+                    arr = np.frombuffer(resp.content, dtype=np.uint8)
+                    frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                    if frame is not None:
+                        with self.lock:
+                            self.latest_frame = frame
+                            self.frame_id += 1
+                        consecutive_failures = 0
+                    else:
+                        consecutive_failures += 1
+                else:
+                    consecutive_failures += 1
+            except Exception:
+                consecutive_failures += 1
+
+            if consecutive_failures >= MAX_CAM_READ_FAILURES:
+                self.error_message = "Camera stream disconnected or timed out."
+                self.error_event.set()
+                break
+
+            time.sleep(0.005)
+
+    def _opencv_worker(self):
+        consecutive_failures = 0
+        while not self.stop_event.is_set():
+            try:
+                ret, frame = self.cap.read()
+                if ret and frame is not None:
+                    with self.lock:
+                        self.latest_frame = frame
+                        self.frame_id += 1
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= MAX_CAM_READ_FAILURES:
+                        self.error_message = "Camera stream disconnected or timed out."
+                        self.error_event.set()
+                        break
+                    time.sleep(0.02)
+            except Exception:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CAM_READ_FAILURES:
+                    self.error_message = "Camera stream read error."
+                    self.error_event.set()
+                    break
+                time.sleep(0.02)
+
+    def get_latest_frame(self):
+        with self.lock:
+            if self.latest_frame is None:
+                return None, 0
+            return self.latest_frame, self.frame_id
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+        if self.http_session:
+            try:
+                self.http_session.close()
+            except Exception:
+                pass
+            self.http_session = None
+
+
+def draw_render_boxes(frame: np.ndarray, render_boxes: list) -> np.ndarray:
+    if not render_boxes:
+        return frame
+    h, w = frame.shape[:2]
+    annotated = frame.copy()
+    for rb in render_boxes:
+        x1 = max(0, min(w - 1, int(rb["norm_x1"] * w)))
+        y1 = max(0, min(h - 1, int(rb["norm_y1"] * h)))
+        x2 = max(0, min(w - 1, int(rb["norm_x2"] * w)))
+        y2 = max(0, min(h - 1, int(rb["norm_y2"] * h)))
+        color = rb.get("color", (0, 140, 255))
+        label = rb.get("label", "")
+
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        if label:
+            (tw, th), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+            y_text = max(y1, th + 4)
+            cv2.rectangle(
+                annotated,
+                (x1, y_text - th - 4),
+                (x1 + tw + 6, y_text + baseline),
+                color,
+                -1,
+            )
+            cv2.putText(
+                annotated,
+                label,
+                (x1 + 3, y_text - 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (255, 255, 255),
+                1,
+                cv2.LINE_AA,
+            )
+    return annotated
+
+
 # ===========================================================================
 # 1. PULL MODEL: WEBSOCKET FOR REAL-TIME IP STREAM / USB CAM
 # ===========================================================================
@@ -1059,10 +1258,12 @@ async def drone_stream_websocket(websocket: WebSocket):
         return
 
     print(f"Connecting to Drone Camera Stream at: {camera_url} | session_id={session_id}", flush=True)
-    cap = await asyncio.to_thread(open_video_capture, camera_url)
 
-    if not cap.isOpened():
-        await asyncio.to_thread(cap.release)
+    grabber = ZeroBufferFrameGrabber(camera_url)
+    started = await asyncio.to_thread(grabber.start)
+
+    if not started:
+        grabber.stop()
         await websocket.send_json({"error": "Failed to connect to IP Camera stream."})
         await websocket.close()
         return
@@ -1070,38 +1271,235 @@ async def drone_stream_websocket(websocket: WebSocket):
     session_model = await asyncio.to_thread(create_session_model)
     session_pothole_data = {}
     track_id_map = {}
-    consecutive_failures = 0
 
-    try:
-        while True:
-            success, frame = await asyncio.to_thread(cap.read)
-            if not success or frame is None:
-                consecutive_failures += 1
-                if consecutive_failures >= MAX_CAM_READ_FAILURES:
-                    print(f"[DroneStream] Camera read timeout for session {session_id}.", flush=True)
-                    await websocket.send_json({"error": "Camera stream disconnected or timed out."})
-                    break
-                await asyncio.sleep(0.05)
+    stop_event = threading.Event()
+    meta_lock = threading.Lock()
+    latest_metadata = {
+        "session_id": session_id,
+        "count": 0,
+        "critical": 0,
+        "high": 0,
+        "medium": 0,
+        "session_total_maintenance_cost": 0,
+        "session_unique_potholes": 0,
+        "detections": [],
+    }
+    latest_render_boxes = []
+
+    def inference_worker():
+        nonlocal latest_metadata, latest_render_boxes
+        last_processed_frame_id = -1
+        while not stop_event.is_set():
+            fresh, f_id = grabber.get_latest_frame()
+            if fresh is None or f_id == last_processed_frame_id:
+                time.sleep(0.005)
                 continue
 
-            consecutive_failures = 0
+            last_processed_frame_id = f_id
+            orig_h, orig_w = fresh.shape[:2]
+
+            # Downscale for inference to max width 640
+            if orig_w > 640:
+                scale = 640.0 / orig_w
+                infer_w = 640
+                infer_h = max(1, int(orig_h * scale))
+                infer_frame = cv2.resize(fresh, (infer_w, infer_h))
+            else:
+                scale = 1.0
+                infer_w = orig_w
+                infer_h = orig_h
+                infer_frame = fresh
+
+            try:
+                with INFERENCE_SEMAPHORE:
+                    results = session_model.track(
+                        infer_frame,
+                        tracker="bytetrack.yaml",
+                        persist=True,
+                        conf=0.60,
+                        imgsz=416,
+                        verbose=False,
+                    )
+            except Exception as e:
+                print(f"[InferenceWorker] Inference error in session {session_id}: {e}", flush=True)
+                time.sleep(0.01)
+                continue
+
+            boxes = results[0].boxes
+            detections = []
+            render_boxes = []
+            critical, high, medium = 0, 0, 0
+
+            if boxes is not None:
+                for box in boxes:
+                    bx1_inf, by1_inf, bx2_inf, by2_inf = box.xyxy[0].tolist()
+                    conf = float(box.conf[0])
+                    raw_track_id = int(box.id[0]) if box.id is not None else None
+
+                    norm_x1 = max(0.0, min(1.0, bx1_inf / infer_w))
+                    norm_y1 = max(0.0, min(1.0, by1_inf / infer_h))
+                    norm_x2 = max(0.0, min(1.0, bx2_inf / infer_w))
+                    norm_y2 = max(0.0, min(1.0, by2_inf / infer_h))
+
+                    x1 = norm_x1 * orig_w
+                    y1 = norm_y1 * orig_h
+                    x2 = norm_x2 * orig_w
+                    y2 = norm_y2 * orig_h
+
+                    if conf >= 0.85:
+                        critical += 1
+                        box_color = (34, 34, 220)  # Red (BGR)
+                    elif conf >= 0.75:
+                        high += 1
+                        box_color = (0, 140, 255)  # Orange / Amber (BGR)
+                    else:
+                        medium += 1
+                        box_color = (40, 190, 80)   # Green (BGR)
+
+                    width_cm, breadth_cm, depth_cm = estimate_pothole_dimensions(
+                        x1, y1, x2, y2, conf, frame_width=orig_w
+                    )
+                    pothole_cost, volume_m3 = calculate_maintenance_cost(width_cm, breadth_cm, depth_cm)
+
+                    display_id = None
+                    if raw_track_id is not None:
+                        if raw_track_id not in track_id_map:
+                            track_id_map[raw_track_id] = len(track_id_map) + 1
+                        display_id = track_id_map[raw_track_id]
+
+                        sighting_score = compute_sighting_score(x1, y1, x2, y2, conf, orig_w, orig_h)
+                        existing = session_pothole_data.get(display_id)
+                        is_first_sighting = existing is None
+                        is_better_sighting = (
+                            existing is not None and sighting_score > existing["best_score"] + 0.03
+                        )
+
+                        if is_first_sighting or is_better_sighting:
+                            crop_path = save_pothole_context_crop(
+                                session_id, display_id, fresh, x1, y1, x2, y2
+                            )
+                            if crop_path is None and existing is not None:
+                                crop_path = existing.get("image_path")
+
+                            record = {
+                                "id": display_id,
+                                "confidence": conf,
+                                "width_cm": width_cm,
+                                "breadth_cm": breadth_cm,
+                                "depth_cm": depth_cm,
+                                "volume_m3": volume_m3,
+                                "estimated_cost": pothole_cost,
+                                "cost": pothole_cost,
+                                "image_path": crop_path,
+                                "best_score": sighting_score,
+                            }
+                            session_pothole_data[display_id] = record
+
+                    label = f"#{display_id} {int(conf * 100)}%" if display_id else f"{int(conf * 100)}%"
+                    render_boxes.append({
+                        "norm_x1": norm_x1,
+                        "norm_y1": norm_y1,
+                        "norm_x2": norm_x2,
+                        "norm_y2": norm_y2,
+                        "color": box_color,
+                        "label": label,
+                    })
+
+                    detections.append({
+                        "id": display_id,
+                        "x1": x1,
+                        "y1": y1,
+                        "x2": x2,
+                        "y2": y2,
+                        "confidence": conf,
+                        "width_cm": width_cm,
+                        "breadth_cm": breadth_cm,
+                        "depth_cm": depth_cm,
+                        "volume_m3": volume_m3,
+                        "estimated_cost": pothole_cost,
+                    })
+
+            session_total_cost = sum(p["cost"] for p in session_pothole_data.values())
+
+            with meta_lock:
+                latest_render_boxes = render_boxes
+                latest_metadata = {
+                    "session_id": session_id,
+                    "count": len(detections),
+                    "critical": critical,
+                    "high": high,
+                    "medium": medium,
+                    "session_total_maintenance_cost": session_total_cost,
+                    "session_unique_potholes": len(session_pothole_data),
+                    "detections": detections,
+                }
+
+    infer_thread = threading.Thread(target=inference_worker, daemon=True)
+    infer_thread.start()
+
+    target_frame_time = 1.0 / 15.0  # ~15 FPS (~66.7ms per frame)
+    try:
+        while True:
+            t_start = time.monotonic()
+
+            if grabber.error_event.is_set():
+                err_msg = grabber.error_message or "Camera stream disconnected or timed out."
+                print(f"[DroneStream] {err_msg} for session {session_id}", flush=True)
+                await websocket.send_json({"error": err_msg})
+                break
+
+            fresh_frame, _ = grabber.get_latest_frame()
+            if fresh_frame is None:
+                await asyncio.sleep(0.02)
+                continue
+
+            with meta_lock:
+                boxes_snapshot = list(latest_render_boxes)
+                meta_snapshot = dict(latest_metadata)
+
+            def prepare_stream_payload(frame_in, boxes_in, meta_in):
+                h, w = frame_in.shape[:2]
+                if w > 960:
+                    down_scale = 960.0 / w
+                    send_frame = cv2.resize(frame_in, (960, int(h * down_scale)))
+                else:
+                    send_frame = frame_in.copy()
+
+                annotated = draw_render_boxes(send_frame, boxes_in)
+                _, buffer = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 55])
+                out_base64 = base64.b64encode(buffer).decode("utf-8")
+
+                return {
+                    "session_id": session_id,
+                    "image": f"data:image/jpeg;base64,{out_base64}",
+                    "count": meta_in.get("count", 0),
+                    "critical": meta_in.get("critical", 0),
+                    "high": meta_in.get("high", 0),
+                    "medium": meta_in.get("medium", 0),
+                    "session_total_maintenance_cost": meta_in.get("session_total_maintenance_cost", 0),
+                    "session_unique_potholes": meta_in.get("session_unique_potholes", 0),
+                    "detections": meta_in.get("detections", []),
+                }
+
             payload = await asyncio.to_thread(
-                process_tracked_frame,
-                session_model,
-                session_id,
-                frame,
-                session_pothole_data,
-                track_id_map,
+                prepare_stream_payload, fresh_frame, boxes_snapshot, meta_snapshot
             )
             await websocket.send_json(payload)
-            await asyncio.sleep(0.005)
+
+            elapsed = time.monotonic() - t_start
+            sleep_duration = max(0.005, target_frame_time - elapsed)
+            await asyncio.sleep(sleep_duration)
 
     except WebSocketDisconnect:
-        print("Frontend disconnected from Drone Stream.", flush=True)
+        print(f"Frontend disconnected from Drone Stream. session={session_id}", flush=True)
     except Exception as e:
-        print(f"Stream error: {e}", flush=True)
+        print(f"Stream error in session {session_id}: {e}", flush=True)
     finally:
-        await asyncio.to_thread(cap.release)
+        grabber.stop()
+        stop_event.set()
+        if infer_thread.is_alive():
+            infer_thread.join(timeout=1.5)
+
         session_model.predictor = None
         pothole_list = [
             {k: v for k, v in p.items() if k != "best_score"}
