@@ -3,7 +3,9 @@
   <img src="https://img.shields.io/badge/FastAPI-Backend-009688?style=for-the-badge&logo=fastapi&logoColor=white" alt="FastAPI" />
   <img src="https://img.shields.io/badge/Next.js_16-Frontend-000000?style=for-the-badge&logo=next.js&logoColor=white" alt="Next.js" />
   <img src="https://img.shields.io/badge/Supabase-Auth_%26_Storage-3FCF8E?style=for-the-badge&logo=supabase&logoColor=white" alt="Supabase" />
-  <img src="https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
+  <img src="https://img.shields.io/badge/Azure-Container_Apps-0078D4?style=for-the-badge&logo=microsoftazure&logoColor=white" alt="Azure" />
+  <img src="https://img.shields.io/badge/Vercel-Frontend-000000?style=for-the-badge&logo=vercel&logoColor=white" alt="Vercel" />
+  <img src="https://img.shields.io/badge/Docker-GHCR-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker" />
 </p>
 
 <h1 align="center">🛣️ RoadGuard AI</h1>
@@ -27,6 +29,9 @@
 - [About the Project](#-about-the-project)
 - [Key Features](#-key-features)
 - [Architecture](#-architecture)
+- [Live Deployment & Production Architecture](#-live-deployment--production-architecture)
+- [Backend Real-Time Streaming Optimizations](#-backend-real-time-streaming-optimizations)
+- [Connecting IP Webcam (Cloud Deployment)](#-connecting-ip-webcam-cloud-deployment)
 - [Tech Stack](#-tech-stack)
 - [Project Structure](#-project-structure)
 - [Prerequisites](#-prerequisites)
@@ -35,7 +40,7 @@
   - [2. Supabase Setup](#2-supabase-setup)
   - [3. Configure Environment Variables](#3-configure-environment-variables)
   - [4A. Local Development (Without Docker)](#4a-local-development-without-docker)
-  - [4B. Production Deployment (Docker Compose)](#4b-production-deployment-docker-compose)
+  - [4B. Production Deployment (Docker & Azure Container Apps)](#4b-production-deployment-docker--azure-container-apps)
 - [API Reference](#-api-reference)
 - [How Detection Works](#-how-detection-works)
 - [Contributing](#-contributing)
@@ -48,7 +53,7 @@
 
 **RoadGuard AI** is a full-stack pothole detection system that uses a custom-trained **YOLOv11** model to detect potholes in real time from live camera feeds (IP/USB/drone cameras, device browser cameras) or uploaded video files. The system estimates each pothole's **physical dimensions** (width, breadth, estimated depth) and calculates **maintenance repair costs** in INR. At the end of every detection session, a branded **PDF report** is automatically generated, uploaded to **Supabase Storage**, and emailed to the administrator.
 
-Authentication is handled via **Supabase Auth** with domain-restricted access (configurable, defaults to `@miet.ac.in`), supporting both **Google OAuth** and **email/password** sign-in.
+Authentication is handled via **Supabase Auth** with configurable domain-restricted access (set `NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN` to restrict, or leave blank to allow any email), supporting both **Google OAuth** and **email/password** sign-in.
 
 ---
 
@@ -66,36 +71,107 @@ Authentication is handled via **Supabase Auth** with domain-restricted access (c
 | **☁️ Cloud Storage** | Reports auto-uploaded to Supabase Storage with public download links |
 | **📧 Email Alerts** | Rich HTML email with session summary + attached PDF sent automatically |
 | **🔐 Domain-Restricted Auth** | Supabase Auth with Google OAuth + email/password, restricted to a configurable email domain |
-| **🐳 Docker Ready** | Full Docker Compose setup with Caddy (HTTPS) + Nginx reverse proxy |
+| **☁️ Cloud Deployed** | Vercel (frontend) + Azure Container Apps (backend) with zero-idle-cost Consumption plan |
 
 ---
 
 ## 🏗️ Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Client Browser                          │
-│  Next.js 16 (Static Export) + Supabase Auth + Leaflet Map      │
-└────────────┬──────────────────────────┬─────────────────────────┘
-             │  WebSocket (frames)      │  REST (video upload)
-             ▼                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Nginx (Port 100)                           │
-│        Static files + reverse proxy to backend                 │
-└────────────┬──────────────────────────┬─────────────────────────┘
-             │  /ws/*                   │  /api/*
-             ▼                          ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                FastAPI Backend (Port 8000)                      │
-│   YOLOv11 inference · ByteTrack · PDF generation · Email       │
-└────────────┬──────────────────────────┬─────────────────────────┘
-             │                          │
-             ▼                          ▼
-     ┌──────────────┐         ┌──────────────────┐
-     │  IP / USB /  │         │    Supabase      │
-     │  Drone Cam   │         │  (Auth + Storage)│
-     └──────────────┘         └──────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                         Client Browser                               │
+│   Next.js 16 + Supabase Auth + Leaflet Satellite Map                 │
+└──────────┬──────────────────────────┬────────────────────────────────┘
+           │  WebSocket (frames)      │  REST (video upload)
+           ▼                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│              Vercel Edge Network (Frontend Hosting)                   │
+│   Static export · CSP + Permissions-Policy headers (vercel.json)     │
+└──────────┬──────────────────────────┬────────────────────────────────┘
+           │  wss://                  │  https://
+           ▼                          ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│       Azure Container Apps — Consumption Plan (Central India)        │
+│   FastAPI + Gunicorn/Uvicorn · YOLOv11 · ByteTrack · PDF · Email    │
+│   GHCR image: ghcr.io/tusharsingh-sde/roadguard-backend:v2          │
+│   2.0 vCPU / 4.0 GiB · min-replicas=0 (₹0 idle cost)               │
+└──────────┬──────────────────┬───────────────┬────────────────────────┘
+           │                  │               │
+           ▼                  ▼               ▼
+  ┌──────────────┐   ┌──────────────┐  ┌──────────────┐
+  │  IP / USB /  │   │   Supabase   │  │  Gmail SMTP  │
+  │  Drone Cam   │   │ Auth+Storage │  │  (Reports)   │
+  └──────────────┘   └──────────────┘  └──────────────┘
 ```
+
+---
+
+## 🌐 Live Deployment & Production Architecture
+
+| Component | URL / Detail |
+|---|---|
+| **Frontend (Vercel)** | [road-guard-ai-lake.vercel.app](https://road-guard-ai-lake.vercel.app) |
+| **Backend (Azure Container Apps)** | [roadguard-backend.agreeablesky-0ffa5750.centralindia.azurecontainerapps.io](https://roadguard-backend.agreeablesky-0ffa5750.centralindia.azurecontainerapps.io) |
+| **Container Registry** | `ghcr.io/tusharsingh-sde/roadguard-backend:v2` (GitHub Container Registry) |
+| **Region / Plan** | Central India · Consumption plan · 2.0 vCPU / 4.0 GiB · **min-replicas=0** (₹0 idle cost) |
+| **Database, Auth & Storage** | Supabase (Google OAuth + Email Auth, session history, PDF report storage) |
+| **Automated Reporting** | PDF generation + Gmail SMTP dispatch on session completion |
+| **Security** | Strict CORS (`ALLOWED_ORIGINS`), Vercel CSP + Permissions-Policy headers (`frontend/vercel.json`), SSRF protection (`ALLOW_PRIVATE_CAM_IPS=false` in production) |
+
+> **Note:** The backend container cold-starts in ~30–60 seconds when scaling from zero. After the first request, subsequent requests are instant.
+
+---
+
+## ⚡ Backend Real-Time Streaming Optimizations
+
+The `/ws/drone-stream` WebSocket endpoint is optimized for **sub-second latency** and **smooth ~15 FPS** streaming on CPU:
+
+| Optimization | How It Works |
+|---|---|
+| **ZeroBufferFrameGrabber** | If the stream is an HTTP IP Webcam URL, it auto-detects `/shot.jpg` support and polls snapshots via a persistent `requests.Session()` (HTTP keep-alive) in a dedicated daemon thread — **zero MJPEG/FFmpeg buffering**. For RTSP/other streams, it uses OpenCV with `fflags=nobuffer`, `flags=low_delay`, and `CAP_PROP_BUFFERSIZE=1`, continuously draining and keeping only the **latest frame**. |
+| **Decoupled Async Inference** | YOLOv11 + ByteTrack runs on a **background worker thread** (`imgsz=416`, max 640px downscale) gated by an `INFERENCE_SEMAPHORE`. Detection results (normalized bounding boxes) are stored behind a thread lock — the WebSocket send loop never blocks on inference. |
+| **~15 FPS Render Loop** | The WebSocket streams frames at ~15 FPS by drawing the latest tracked boxes onto the freshest captured frame. JPEG quality is set to **55** for minimal bandwidth while preserving readability. Full-resolution dimension estimation is preserved using the original frame dimensions. |
+| **Clean Teardown** | On disconnect or session end, the frame grabber is stopped, the PDF report is generated, uploaded to Supabase, and emailed — all asynchronously without blocking the WebSocket close. |
+
+---
+
+## 📱 Connecting IP Webcam (Cloud Deployment)
+
+When the backend is deployed to the cloud (Azure Container Apps), it **cannot access your phone's local LAN IP** (e.g., `192.168.1.x:8080`) due to network isolation and SSRF protection.
+
+### Solution: Cloudflare Quick Tunnel (Free, No Account Needed)
+
+1. **Install IP Webcam** on your Android phone ([Google Play](https://play.google.com/store/apps/details?id=com.pas.webcam))
+   - Recommended settings: **640×480**, **15 FPS**, **50% JPEG quality**
+   - Tap **Start Server** — note the local URL (e.g., `http://192.168.1.3:8080`)
+
+2. **Install Cloudflared** on your PC:
+   ```bash
+   # Windows (winget)
+   winget install --id Cloudflare.cloudflared
+
+   # macOS
+   brew install cloudflared
+
+   # Linux
+   sudo apt install cloudflared
+   ```
+
+3. **Start the tunnel** (points to your phone's IP Webcam):
+   ```bash
+   cloudflared tunnel --url http://192.168.1.3:8080
+   ```
+   You'll see a public URL like `https://xxxx-yyyy-zzzz.trycloudflare.com`
+
+4. **Paste in RoadGuard AI:**
+   ```
+   https://xxxx-yyyy-zzzz.trycloudflare.com/video
+   ```
+   Enter this URL in the **IP Camera URL** field on the dashboard and click **Start IP Camera**.
+
+5. **Stop the tunnel** when done: Press `Ctrl+C` in the terminal.
+
+> **💡 Tip:** For quick mobile demos without any setup, use the **"Use Device Camera"** button — it uses your phone or laptop's built-in browser camera directly via WebRTC.
 
 ---
 
@@ -124,15 +200,17 @@ Authentication is handled via **Supabase Auth** with domain-restricted access (c
 | **Tailwind CSS 4** | Utility-first styling |
 | **Supabase JS SDK** | Authentication (Google OAuth + email/password) |
 | **Leaflet + React-Leaflet** | Satellite map with pothole markers |
-| **Nginx** | Static file serving + API/WebSocket reverse proxy |
+| **Vercel** | Frontend hosting with edge CDN + security headers |
 
 ### Infrastructure
 
 | Technology | Purpose |
 |---|---|
-| **Docker Compose** | Multi-container orchestration |
-| **Caddy** | Automatic HTTPS with Let's Encrypt |
-| **nip.io** | DNS for VM public IP (development) |
+| **Vercel** | Frontend hosting (edge network, automatic HTTPS) |
+| **Azure Container Apps** | Backend hosting (Consumption plan, auto-scale to zero) |
+| **GitHub Container Registry** | Docker image storage (`ghcr.io`) |
+| **Docker** | Backend containerization (Python 3.12-slim) |
+| **Supabase** | Auth (Google OAuth + Email) + Cloud Storage (PDF reports) |
 
 ---
 
@@ -162,14 +240,15 @@ roadguard-email-auth/
 │   │   └── AuthProvider.tsx     # React context for auth state management
 │   ├── supabase/sql/
 │   │   └── restrict_email_domain.sql  # DB-level domain restriction trigger
-│   ├── nginx.conf               # Nginx config for Docker (proxy + WebSocket)
+│   ├── vercel.json              # Vercel headers (CSP, Permissions-Policy)
+│   ├── nginx.conf               # Legacy Nginx config for Docker
 │   ├── dockerfile               # Multi-stage build (Node → Nginx)
 │   ├── .env.example             # Frontend environment template
 │   ├── package.json             # Node dependencies
 │   └── next.config.ts           # Static export configuration
 │
-├── docker-compose.yml           # Backend + Frontend + Caddy orchestration
-├── Caddyfile                    # Reverse proxy with auto-HTTPS
+├── docker-compose.yml           # Legacy: local multi-container orchestration
+├── Caddyfile                    # Legacy: reverse proxy with auto-HTTPS
 ├── .gitignore
 └── README.md                    # ← You are here
 ```
@@ -383,56 +462,70 @@ The frontend will be running at **`http://localhost:3000`**.
 
 ---
 
-### 4B. Production Deployment (Docker Compose)
+### 4B. Production Deployment (Docker & Azure Container Apps)
 
-This is the recommended approach for deploying to a cloud VM (Azure, AWS, GCP, etc.).
+The production setup uses **Vercel** for the frontend and **Azure Container Apps** for the backend.
 
-#### Step 1: Update the Caddyfile
-
-Edit the `Caddyfile` and replace the IP address with your VM's public IP:
-
-```
-YOUR_VM_PUBLIC_IP.nip.io {
-    reverse_proxy frontend:100
-}
-```
-
-#### Step 2: Build and Start
+#### Step 1: Build & Push the Backend Docker Image
 
 ```bash
+cd backend
+
+# Build the image
+docker build -t ghcr.io/YOUR_GITHUB_USERNAME/roadguard-backend:v2 .
+
+# Login to GitHub Container Registry
+echo "YOUR_GITHUB_PAT" | docker login ghcr.io -u YOUR_GITHUB_USERNAME --password-stdin
+
+# Push the image
+docker push ghcr.io/YOUR_GITHUB_USERNAME/roadguard-backend:v2
+```
+
+> After pushing, go to **GitHub → Packages → `roadguard-backend` → Package settings → Change visibility → Public**.
+
+#### Step 2: Deploy to Azure Container Apps
+
+```bash
+# Create resource group
+az group create --name roadguard-rg --location centralindia
+
+# Create Container Apps environment
+az containerapp env create \
+  --name roadguard-env \
+  --resource-group roadguard-rg \
+  --location centralindia
+
+# Deploy the backend
+az containerapp create \
+  --name roadguard-backend \
+  --resource-group roadguard-rg \
+  --environment roadguard-env \
+  --image ghcr.io/YOUR_GITHUB_USERNAME/roadguard-backend:v2 \
+  --target-port 8000 \
+  --ingress external \
+  --cpu 2.0 --memory 4.0Gi \
+  --min-replicas 0 --max-replicas 1 \
+  --env-vars \
+    SUPABASE_URL=your-url \
+    SUPABASE_KEY=your-key \
+    ALLOWED_ORIGINS=https://your-vercel-app.vercel.app
+```
+
+#### Step 3: Deploy Frontend to Vercel
+
+1. Push your repo to GitHub
+2. Import the repo in [Vercel](https://vercel.com/) → set **Root Directory** to `frontend`
+3. Add environment variables: `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `NEXT_PUBLIC_BACKEND_URL`
+4. Deploy — Vercel handles HTTPS, CDN, and edge routing automatically
+
+#### Useful Docker Commands (Local Testing)
+
+```bash
+# Legacy Docker Compose (for local VM testing)
 docker compose up -d --build
-```
 
-This starts three containers:
-
-| Container | Role | Port |
-|---|---|---|
-| `back-nitin` | FastAPI + YOLOv11 backend | Internal (8000) |
-| `front-nitin` | Next.js static export via Nginx | Internal (100) |
-| `caddy-nitin` | HTTPS reverse proxy | 80, 443 |
-
-#### Step 3: Access the Application
-
-Open your browser and navigate to:
-
-```
-https://YOUR_VM_PUBLIC_IP.nip.io
-```
-
-Caddy will automatically provision an HTTPS certificate via Let's Encrypt.
-
-#### Useful Docker Commands
-
-```bash
 # View logs
 docker compose logs -f backend
-docker compose logs -f frontend
-
-# Restart a specific service
-docker compose restart backend
-
-# Rebuild after code changes
-docker compose up -d --build
 
 # Stop everything
 docker compose down
@@ -536,6 +629,9 @@ This project is open source. See the repository for license details.
 - [ReportLab](https://www.reportlab.com/) — PDF generation
 - [Caddy](https://caddyserver.com/) — Automatic HTTPS server
 - [ByteTrack](https://github.com/ifzhang/ByteTrack) — Multi-object tracking
+- [Azure Container Apps](https://azure.microsoft.com/en-us/products/container-apps) — Serverless container hosting
+- [Vercel](https://vercel.com/) — Frontend edge deployment
+- [Cloudflare Tunnels](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) — Secure tunnel for local camera streams
 
 ---
 
