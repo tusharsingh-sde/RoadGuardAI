@@ -29,6 +29,34 @@ const PotholeMap = dynamic(() => import("./PotholeMap"), {
 
 const supabase = getSupabaseClient();
 
+const IconIpCam = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M23 7l-7 5 7 5V7z" />
+    <rect x="1" y="5" width="15" height="14" rx="2" />
+  </svg>
+);
+
+const IconDeviceCam = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="5" y="2" width="14" height="20" rx="2" />
+    <line x1="12" y1="18" x2="12.01" y2="18" />
+  </svg>
+);
+
+const IconUpload = () => (
+  <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+    <polyline points="17 8 12 3 7 8" />
+    <line x1="12" y1="3" x2="12" y2="15" />
+  </svg>
+);
+
+const IconStop = () => (
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+    <rect x="4" y="4" width="16" height="16" rx="2.5" />
+  </svg>
+);
+
 const ENV_BACKEND_URL = (process.env.NEXT_PUBLIC_BACKEND_URL || "")
   .trim()
   .replace(/\/+$/, "");
@@ -136,7 +164,7 @@ export default function DashboardPage() {
   const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
   const [liveAddress, setLiveAddress] = useState<string>("Locating system coordinates...");
 
-  const [ipCamUrl, setIpCamUrl] = useState("http://192.168.1.3:8080/video");
+  const [ipCamUrl, setIpCamUrl] = useState("");
   const [isStreamingDrone, setIsStreamingDrone] = useState(false);
   const [isStreamingDevice, setIsStreamingDevice] = useState(false);
   const [droneImageSrc, setDroneImageSrc] = useState<string | null>(null);
@@ -1317,7 +1345,22 @@ function LiveDetectionView(props: {
               <img src={droneImageSrc} alt="Live road feed" className="road-video" />
             ) : (
               <div className="camera-placeholder">
-                <div className="camera-icon">{"📹"}</div>
+                <div className="camera-icon">
+                  <svg
+                    width="36"
+                    height="36"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M23 7l-7 5 7 5V7z" />
+                    <rect x="1" y="5" width="15" height="14" rx="2" />
+                  </svg>
+                </div>
                 <h3>Camera / Video Feed</h3>
                 <p>Enter a reachable RTSP/HTTP stream URL or use your local device camera</p>
                 <div
@@ -1335,7 +1378,7 @@ function LiveDetectionView(props: {
                     className="ip-input"
                     value={ipCamUrl}
                     onChange={(e) => setIpCamUrl(e.target.value)}
-                    placeholder="http://192.168.1.100:8080/video or 0"
+                    placeholder="https://your-stream-url/video or 0"
                   />
                 </div>
               </div>
@@ -1350,13 +1393,14 @@ function LiveDetectionView(props: {
             onChange={handleBulkUpload}
           />
 
-          <div className="session-controls-row" style={{ flexWrap: "wrap", gap: "10px" }}>
+          <div className="session-controls-row">
             <button
               className="btn btn-primary"
               onClick={startDroneStream}
               disabled={isAnyStreamActive || isUploading}
             >
-              {"📹"} Start IP/USB Cam
+              <IconIpCam />
+              <span>Start IP/USB Cam</span>
             </button>
             <button
               className="btn btn-secondary"
@@ -1364,7 +1408,8 @@ function LiveDetectionView(props: {
               disabled={isAnyStreamActive || isUploading}
               style={{ backgroundColor: "#2d3748", color: "white" }}
             >
-              {"📱"} Use Device Camera
+              <IconDeviceCam />
+              <span>Use Device Camera</span>
             </button>
             <button
               className="btn btn-secondary"
@@ -1372,15 +1417,18 @@ function LiveDetectionView(props: {
               disabled={isAnyStreamActive || isUploading}
               style={{ backgroundColor: "#1a7d43", color: "white" }}
             >
-              {"📂"} Upload Video
+              <IconUpload />
+              <span>Upload Video</span>
             </button>
-            <button
-              className="btn btn-danger"
-              onClick={endSession}
-              disabled={!isAnyStreamActive}
-            >
-              {"■"} End Session
-            </button>
+            {isAnyStreamActive && (
+              <button
+                className="btn btn-danger btn-end-full"
+                onClick={endSession}
+              >
+                <IconStop />
+                <span>End Session</span>
+              </button>
+            )}
           </div>
         </section>
 
@@ -1412,7 +1460,11 @@ function LiveDetectionView(props: {
             <div className="empty-state">
               <div className="empty-icon">{"◉"}</div>
               <h3>No Potholes Detected</h3>
-              <p>AI is currently monitoring the road video.</p>
+              <p>
+                {isAnyStreamActive
+                  ? "AI is currently monitoring the road video."
+                  : "Start a feed or upload a video to begin monitoring."}
+              </p>
             </div>
           ) : (
             <div className="detection-list" style={{ maxHeight: 340, overflowY: "auto" }}>

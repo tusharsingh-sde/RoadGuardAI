@@ -385,7 +385,7 @@ button {
   display: grid;
   grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr);
   gap: 16px;
-  align-items: start;
+  align-items: stretch;
 }
 
 .panel {
@@ -397,6 +397,8 @@ button {
 
 .camera-card {
   min-height: 460px;
+  display: flex;
+  flex-direction: column;
 }
 
 .card-header {
@@ -655,6 +657,13 @@ button {
 
 .detections-card {
   min-height: 260px;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.detections-card .empty-state {
+  flex: 1;
 }
 
 .detection-count {
@@ -782,14 +791,21 @@ button {
 
 .session-controls-row {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin: 14px;
 }
 
 .session-controls-row .btn {
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
+  gap: 8px;
   padding: 12px;
+}
+
+.session-controls-row .btn-end-full {
+  grid-column: 1 / -1;
 }
 
 .session-card {
