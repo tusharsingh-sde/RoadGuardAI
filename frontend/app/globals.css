@@ -127,17 +127,21 @@ button {
   color: var(--rg-green-600);
 }
 
-.brand p {
+.brand p,
+.sidebar-subtitle {
   margin: 2px 0 0;
-  font-size: 11px;
-  color: var(--rg-ink-faint);
+  font-size: 11.5px;
+  color: #475569;
+  font-weight: 500;
   white-space: nowrap;
 }
 
-.sidebar-toggle {
+.sidebar-toggle,
+.sidebar-collapse-btn {
   border: 1px solid var(--rg-border);
   background: var(--rg-white);
-  color: var(--rg-ink-muted);
+  color: #475569;
+  font-weight: 600;
   width: 26px;
   height: 26px;
   border-radius: var(--rg-radius-sm);
@@ -145,12 +149,15 @@ button {
   flex-shrink: 0;
   display: grid;
   place-items: center;
-  font-size: 12px;
+  font-size: 13px;
+  transition: all 0.15s ease;
 }
 
-.sidebar-toggle:hover {
-  border-color: var(--rg-border-strong);
-  color: var(--rg-ink);
+.sidebar-toggle:hover,
+.sidebar-collapse-btn:hover {
+  border-color: #94a3b8;
+  background-color: #f8fafc;
+  color: #0f172a;
 }
 
 /* =========================
@@ -163,10 +170,12 @@ button {
   gap: 2px;
 }
 
-.nav-item {
+.nav-item,
+.sidebar-nav-item {
   border: 0;
   background: transparent;
-  color: var(--rg-ink-muted);
+  color: #334155;
+  font-weight: 500;
   padding: 10px 12px;
   border-radius: var(--rg-radius-sm);
   text-align: left;
@@ -176,21 +185,33 @@ button {
   gap: 11px;
   font-size: 13.5px;
   width: 100%;
+  transition: color 0.15s ease, background-color 0.15s ease;
 }
 
-.nav-item:hover {
-  background: var(--rg-surface-tint);
-  color: var(--rg-ink);
+.nav-item:hover,
+.sidebar-nav-item:hover {
+  background-color: #f1f5f9;
+  color: #0f172a;
 }
 
-.nav-item.active {
+.nav-item.active,
+.sidebar-nav-item.active {
   background: var(--rg-green-50);
-  color: var(--rg-green-700);
+  color: #15803d;
   font-weight: 600;
 }
 
-.nav-item.logout {
-  color: var(--rg-ink-faint);
+.nav-item.logout,
+.sidebar-logout {
+  color: #475569;
+  font-weight: 500;
+  transition: color 0.15s ease, background-color 0.15s ease;
+}
+
+.nav-item.logout:hover,
+.sidebar-logout:hover {
+  color: #dc2626;
+  background-color: #fef2f2;
 }
 
 .nav-icon {
