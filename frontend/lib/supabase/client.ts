@@ -39,13 +39,18 @@ export function getSupabaseClient(): SupabaseClient {
   return browserClient;
 }
 
-// The only domain allowed to use RoadGuard AI. Configurable via env so it
-// isn't hardcoded, but defaults to the domain specified in the brief.
-export const ALLOWED_EMAIL_DOMAIN =
-  process.env.NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN || "miet.ac.in";
+// Optional domain restriction. Leave NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN blank
+// or commented out to allow any email/Google account.
+export const ALLOWED_EMAIL_DOMAIN = (
+  process.env.NEXT_PUBLIC_ALLOWED_EMAIL_DOMAIN ?? ""
+)
+  .trim()
+  .toLowerCase()
+  .replace(/^@/, "");
 
 export function isAuthorizedEmail(email: string | null | undefined): boolean {
   if (!email) return false;
+  if (!ALLOWED_EMAIL_DOMAIN) return true;
   const domain = email.split("@")[1]?.toLowerCase();
-  return domain === ALLOWED_EMAIL_DOMAIN.toLowerCase();
+  return domain === ALLOWED_EMAIL_DOMAIN;
 }

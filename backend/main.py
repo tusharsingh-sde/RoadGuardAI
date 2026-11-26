@@ -55,7 +55,7 @@ def get_report_executor() -> ThreadPoolExecutor:
 
 async def _periodic_cleanup_loop():
     while True:
-        await asyncio.sleep(3600)  # Har 1 ghante mein expired files clean hon
+        await asyncio.sleep(3600)  # expired file will be cleared in 1hr
         try:
             await asyncio.to_thread(cleanup_expired_files)
         except Exception as e:

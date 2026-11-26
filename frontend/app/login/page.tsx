@@ -171,7 +171,11 @@ export default function LoginPage() {
                 <input
                   type="email"
                   autoComplete="email"
-                  placeholder={`you@${ALLOWED_EMAIL_DOMAIN}`}
+                  placeholder={
+                    ALLOWED_EMAIL_DOMAIN
+                      ? `you@${ALLOWED_EMAIL_DOMAIN}`
+                      : "you@example.com"
+                  }
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   required
@@ -230,16 +234,20 @@ export default function LoginPage() {
             {googleSubmitting ? "Redirecting to Google…" : "Continue with Google"}
           </button>
 
-          <p className="login-domain-note">
-            Access is limited to @{ALLOWED_EMAIL_DOMAIN} accounts.
-          </p>
+          {ALLOWED_EMAIL_DOMAIN && (
+            <p className="login-domain-note">
+              Access is limited to @{ALLOWED_EMAIL_DOMAIN} accounts.
+            </p>
+          )}
 
           {!confirmationSent &&
             (formError || status === "unauthorized-domain" || errorMessage) && (
               <div className="login-error">
                 {formError ||
                   errorMessage ||
-                  `You are not eligible to access RoadGuard AI. Please use your @${ALLOWED_EMAIL_DOMAIN} account.`}
+                  (ALLOWED_EMAIL_DOMAIN
+                    ? `You are not eligible to access RoadGuard AI. Please use your @${ALLOWED_EMAIL_DOMAIN} account.`
+                    : "You are not eligible to access RoadGuard AI.")}
               </div>
             )}
         </div>
