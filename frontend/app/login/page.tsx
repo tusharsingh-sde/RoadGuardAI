@@ -6,10 +6,89 @@ import { useAuth } from "@/lib/supabase/AuthProvider";
 import { ALLOWED_EMAIL_DOMAIN } from "@/lib/supabase/client";
 
 const FEATURES = [
-  { icon: "\u{1F4F9}", label: "Real-time Detection" },
-  { icon: "\u{1F9E0}", label: "AI Powered" },
-  { icon: "\u20B9", label: "Cost Estimation" },
-  { icon: "\u{1F4CA}", label: "Detailed Reports" },
+  {
+    title: "Live Drone & Cam",
+    desc: "IP Webcam, USB & mobile streams",
+    icon: (
+      <svg
+        width="22"
+        height="22"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M23 7l-7 5 7 5V7z" />
+        <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+      </svg>
+    ),
+  },
+  {
+    title: "YOLOv11 + ByteTrack",
+    desc: "Real-time pothole detection & tracking",
+    icon: (
+      <svg
+        width="22"
+        height="22"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M3 7V5a2 2 0 0 1 2-2h2" />
+        <path d="M17 3h2a2 2 0 0 1 2 2v2" />
+        <path d="M21 17v2a2 2 0 0 1-2 2h-2" />
+        <path d="M7 21H5a2 2 0 0 1-2-2v-2" />
+        <circle cx="12" cy="12" r="3" />
+      </svg>
+    ),
+  },
+  {
+    title: "Instant ₹ Costing",
+    desc: "Automated PWD-grade repair estimates",
+    icon: (
+      <svg
+        width="22"
+        height="22"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M6 3h12" />
+        <path d="M6 8h12" />
+        <path d="m6 13 8.5 8" />
+        <path d="M6 13h3a4 4 0 0 0 0-8" />
+      </svg>
+    ),
+  },
+  {
+    title: "Geo-Tagged PDFs",
+    desc: "Auto-emailed inspection reports",
+    icon: (
+      <svg
+        width="22"
+        height="22"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+        <polyline points="14 2 14 8 20 8" />
+        <line x1="16" y1="13" x2="8" y2="13" />
+        <line x1="16" y1="17" x2="8" y2="17" />
+      </svg>
+    ),
+  },
 ];
 
 type Mode = "sign-in" | "sign-up";
@@ -104,30 +183,54 @@ export default function LoginPage() {
   return (
     <div className="login-shell">
       <section className="login-hero">
-        <div className="brand">
-          <div className="brand-logo">{"\u{1F6E3}\uFE0F"}</div>
+        <div className="brand login-brand-lockup">
+          <div className="brand-logo login-brand-logo">
+            <svg
+              width="26"
+              height="26"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            >
+              <path d="M4 19L8 5" />
+              <path d="M20 19L16 5" />
+              <line x1="12" y1="7" x2="12" y2="9" />
+              <line x1="12" y1="13" x2="12" y2="15" />
+            </svg>
+          </div>
           <div>
-            <h1>
+            <h1 className="login-brand-name">
               RoadGuard <span>AI</span>
             </h1>
-            <p>Pothole Detection System</p>
+            <p className="login-brand-sub">Pothole Detection System</p>
           </div>
         </div>
 
-        <h2>
+        <div className="login-status-pill">
+          <span className="login-status-dot" />
+          <span>YOLOv11 • LIVE ROAD TELEMETRY</span>
+        </div>
+
+        <h2 className="login-hero-title">
           Smarter Roads,
           <span>Safer Journeys</span>
         </h2>
-        <p>
+        <p className="login-hero-desc">
           AI-powered pothole detection and road condition monitoring for
           better infrastructure management.
         </p>
 
-        <div className="login-features">
+        <div className="login-features-grid">
           {FEATURES.map((feature) => (
-            <div className="login-feature" key={feature.label}>
+            <div className="login-feature-card" key={feature.title}>
               <div className="login-feature-icon">{feature.icon}</div>
-              <span>{feature.label}</span>
+              <div className="login-feature-content">
+                <div className="login-feature-title">{feature.title}</div>
+                <div className="login-feature-desc">{feature.desc}</div>
+              </div>
             </div>
           ))}
         </div>
